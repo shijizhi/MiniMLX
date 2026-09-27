@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/minimlx-protocol",
+    "crates/minimlx-supervisor",
+    "crates/minimlx-api",
+    "crates/minimlx-gpui",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"

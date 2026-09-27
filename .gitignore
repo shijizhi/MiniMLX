@@ -1,0 +1,25 @@
+# Local environments and generated build output
+.venv/
+.build/
+.swiftpm/
+target/
+native/**/build/
+
+# Machine-local runtime settings
+config/minimlx.local.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Native/Metal build products
+*.so
+*.dylib
+*.metallib
+*.air
+
+# macOS metadata
+.DS_Store

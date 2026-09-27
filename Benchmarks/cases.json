@@ -1,0 +1,5 @@
+[
+  {"name": "short", "prompt": "Hello", "max_tokens": 16},
+  {"name": "english", "prompt": "Write a short introduction about machine learning.", "max_tokens": 64},
+  {"name": "mixed", "prompt": "请用英文解释什么是 GPU。", "max_tokens": 64}
+]

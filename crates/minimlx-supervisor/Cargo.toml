@@ -1,0 +1,10 @@
+[package]
+name = "minimlx-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+minimlx-protocol = { path = "../minimlx-protocol" }
+serde_json = "1"
+thiserror = "2"

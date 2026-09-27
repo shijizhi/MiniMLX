@@ -1,0 +1,9 @@
+[package]
+name = "minimlx-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+minimlx-protocol = { path = "../minimlx-protocol" }
+minimlx-supervisor = { path = "../minimlx-supervisor" }

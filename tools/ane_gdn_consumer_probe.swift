@@ -1,0 +1,9 @@
+import CoreML
+import Foundation
+func read(_ p:String)->[Float]{let d=try! Data(contentsOf:URL(fileURLWithPath:p));return d.withUnsafeBytes{Array($0.bindMemory(to:Float.self))}}
+func arr(_ x:[Float],_ s:[NSNumber])->MLMultiArray{let a=try! MLMultiArray(shape:s,dataType:.float32);x.withUnsafeBufferPointer{a.dataPointer.copyMemory(from:$0.baseAddress!,byteCount:x.count*4)};return a}
+let a=CommandLine.arguments;let model=try MLModel(contentsOf:URL(fileURLWithPath:a[1]));let p=a[2];let t=Int(a[3])!,h=Int(a[4])!,dk=Int(a[5])!,dv=Int(a[6])!,hidden=Int(a[7])!
+let f:[String:MLMultiArray]=[
+ "q":arr(read("\(p)/q.bin"),[NSNumber(value:t),NSNumber(value:h),NSNumber(value:dk)]),"k":arr(read("\(p)/k.bin"),[NSNumber(value:t),NSNumber(value:h),NSNumber(value:dk)]),"v":arr(read("\(p)/v.bin"),[NSNumber(value:t),NSNumber(value:h),NSNumber(value:dv)]),"g":arr(read("\(p)/g.bin"),[NSNumber(value:t),NSNumber(value:h)]),"beta":arr(read("\(p)/beta.bin"),[NSNumber(value:t),NSNumber(value:h)]),"z":arr(read("\(p)/z.bin"),[NSNumber(value:t),NSNumber(value:h),NSNumber(value:dv)]),"state_workaround":arr(read("\(p)/state.bin"),[1,NSNumber(value:h),NSNumber(value:dv),NSNumber(value:dk)]),"output_weight":arr(read("\(p)/output_weight.bin"),[NSNumber(value:h*dv),NSNumber(value:hidden)])]
+let provider=try MLDictionaryFeatureProvider(dictionary:f.mapValues{MLFeatureValue(multiArray:$0)});_ = try model.prediction(from:provider);let st=DispatchTime.now().uptimeNanoseconds;let r=try model.prediction(from:provider);let ms=Double(DispatchTime.now().uptimeNanoseconds-st)/1e6;print("elapsed_ms=\(String(format:"%.3f",ms))")
+for n in ["matmul_0","while_loop_0_1"] {if let x=r.featureValue(for:n)?.multiArrayValue{let q=x.dataPointer.bindMemory(to:Float.self,capacity:x.count);try! Data(bytes:q,count:x.count*4).write(to:URL(fileURLWithPath:"\(p)/\(n).bin"));print("\(n) shape=\(x.shape) count=\(x.count)")}}

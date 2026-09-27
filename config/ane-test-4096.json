@@ -1,0 +1,11 @@
+{
+  "model_dir": "/Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-0.8B-MLX-4bit",
+  "mode": "benchmark",
+  "prompt_file": "Resources/BenchmarkCorpus/code_python.txt",
+  "context_tokens": 4096,
+  "max_tokens": 128,
+  "warmup": 32,
+  "repeats": 5,
+  "prefill_step_size": 1024,
+  "python": "/Users/jizhishi/mycode/ai/minimlx/.venv/bin/python"
+}
