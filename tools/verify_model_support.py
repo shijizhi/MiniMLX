@@ -1,21 +1,48 @@
 #!/usr/bin/env python3
 """Verify a model against MiniMLX's model-family adapter.
 
-This is a compatibility smoke test, not a performance benchmark.  It checks
-descriptor resolution, model loading, Qwen3.5 layer structure, and a short
-greedy generation.  Quantized-only optimizations are reported separately so
-BF16 models can share the family adapter without being treated as Q4 models.
+This is a compatibility smoke test, not a performance benchmark. It checks
+descriptor resolution, model loading, and short greedy generation for every
+registered text family. Qwen3.5 additionally reports its family-specific
+structure and MTP checks.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "python"))
+
+from minimlx_runtime.types import Acceleration, ModelTask
+
+
+def _execution_route_summary(plan, mtp_enabled: bool) -> dict[str, object]:
+    """Return and validate the route selected by the unified inference path."""
+    if plan is None or plan.task is not ModelTask.GENERATION:
+        raise RuntimeError("generation did not publish a generation ExecutionPlan")
+    accelerations = sorted(item.value for item in plan.accelerations)
+    if mtp_enabled != (Acceleration.MTP.value in accelerations):
+        raise RuntimeError(
+            "loaded decode backend and resolved execution plan disagree: "
+            f"mtp_enabled={mtp_enabled}, plan_accelerations={accelerations}"
+        )
+    return {
+        "task": plan.task.value,
+        "task_adapter": plan.task_adapter,
+        "family_adapter": plan.family_adapter,
+        "backend_adapter": plan.backend_adapter,
+        "accelerations": accelerations,
+    }
+
+
+def _print_execution_route(runtime, mtp_enabled: bool) -> None:
+    summary = _execution_route_summary(runtime.execution_plan, mtp_enabled)
+    print("execution_route=" + json.dumps(summary, sort_keys=True))
 
 
 def main() -> None:
@@ -76,6 +103,47 @@ def main() -> None:
     runtime = Runtime()
     runtime.load(args.model_dir)
     adapter = runtime.adapter
+    if not hasattr(adapter, "_mtp_enabled"):
+        if (
+            args.compare_mtp_target_ar
+            or args.mtp_test_boundaries
+            or forced_index is not None
+        ):
+            parser.error("MTP-specific options require the Qwen3.5 adapter")
+        result = runtime.generate(
+            args.prompt,
+            max_tokens=args.max_tokens,
+            prefill_step_size=1024,
+        )
+        _print_execution_route(runtime, False)
+        if not result.generated_tokens or not result.text:
+            raise RuntimeError("short generation returned no output")
+        print(f"family_adapter={runtime.execution_plan.family_adapter}")
+        print(
+            "model_shape="
+            + json.dumps(
+                {
+                    key: descriptor.metadata.get(key)
+                    for key in (
+                        "num_hidden_layers",
+                        "hidden_size",
+                        "num_attention_heads",
+                        "num_key_value_heads",
+                        "intermediate_size",
+                        "max_position_embeddings",
+                        "quantization",
+                    )
+                },
+                sort_keys=True,
+            )
+        )
+        print(f"prompt_tokens={result.prompt_tokens}")
+        print(f"generated_tokens={result.generated_tokens}")
+        print(f"generated_text={json.dumps(result.text, ensure_ascii=False)}")
+        print(f"prefill_ms={result.prefill_ms:.3f}")
+        print(f"decode_ms={result.decode_ms:.3f}")
+        print("compatibility_smoke=PASS")
+        return
     forced_target_tokens: dict[int, int] = {}
     restore_boundary_hook = None
     if forced_index is not None:
@@ -96,13 +164,34 @@ def main() -> None:
         layer for layer in layers
         if getattr(getattr(layer, "mlp", None), "switch_mlp", None) is not None
     ]
-    q4_dense_mlp_layers = sum(
-        hasattr(getattr(layer, "mlp", None), "bits")
-        or hasattr(getattr(getattr(layer, "mlp", None), "gate_proj", None), "bits")
-        for layer in layers
-    )
+    dense_mlp_quantized_layers_by_bits: dict[int, int] = {}
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        projections = (
+            mlp,
+            getattr(mlp, "gate_proj", None),
+            getattr(mlp, "up_proj", None),
+            getattr(mlp, "down_proj", None),
+        )
+        layer_bits = {
+            int(projection.bits)
+            for projection in projections
+            if projection is not None and hasattr(projection, "bits")
+        }
+        for bits in layer_bits:
+            dense_mlp_quantized_layers_by_bits[bits] = (
+                dense_mlp_quantized_layers_by_bits.get(bits, 0) + 1
+            )
+    q4_dense_mlp_layers = dense_mlp_quantized_layers_by_bits.get(4, 0)
     print(f"layers={len(layers)} linear_attention={linear_layers} full_attention={full_layers}")
     print(f"decode_backend={'mtp' if adapter._mtp_enabled else 'autoregressive'}")
+    print(
+        "dense_mlp_quantized_layers_by_bits="
+        + json.dumps(
+            {str(bits): count for bits, count in sorted(dense_mlp_quantized_layers_by_bits.items())},
+            sort_keys=True,
+        )
+    )
     print(f"q4_dense_mlp_layers={q4_dense_mlp_layers}")
     print("q4_prefill_dense_active=" + str(q4_dense_mlp_layers > 0))
     if moe_layers:
@@ -150,6 +239,11 @@ def main() -> None:
             raise RuntimeError(f"inconsistent MoE expert tensor shapes: {expert_counts}")
         print(f"q4_moe_expert_layers={q4_expert_layers}")
     print("family_adapter=Qwen35Adapter")
+    if adapter._mtp_enabled:
+        print(
+            "mtp_verify_argmax="
+            + os.environ.get("MINIMLX_MTP_VERIFY_ARGMAX", "logits")
+        )
 
     if args.mtp_test_boundaries:
         if not adapter._mtp_enabled:
@@ -163,6 +257,7 @@ def main() -> None:
             max_tokens=args.max_tokens,
             prefill_step_size=1024,
         )
+        _print_execution_route(runtime, adapter._mtp_enabled)
     finally:
         if restore_boundary_hook is not None:
             restore_boundary_hook()
@@ -302,6 +397,7 @@ def _install_mtp_boundary_test_hook(adapter, mode, forced_target_tokens):
     lm = adapter.model.language_model
     original_argmax = lm.speculative_argmax_from_hidden
     original_verify_hidden = lm.speculative_verify_hidden
+    original_adapter_argmax_hook = adapter._mtp_argmax_hook
     draft_model = adapter._mtp_draft_model
     original_draft_block = draft_model.draft_block
     latest_draft_tokens: list[int] = []
@@ -352,11 +448,13 @@ def _install_mtp_boundary_test_hook(adapter, mode, forced_target_tokens):
 
     draft_model.draft_block = record_draft
     lm.speculative_argmax_from_hidden = controlled_argmax
+    adapter._mtp_argmax_hook = controlled_argmax
     lm.speculative_verify_hidden = mark_verifier_forward
 
     def restore():
         draft_model.draft_block = original_draft_block
         lm.speculative_argmax_from_hidden = original_argmax
+        adapter._mtp_argmax_hook = original_adapter_argmax_hook
         lm.speculative_verify_hidden = original_verify_hidden
 
     return restore
@@ -375,6 +473,7 @@ def _run_mtp_boundary_tests(runtime, adapter, prompt, max_tokens) -> None:
         restore = _install_mtp_boundary_test_hook(adapter, mode, forced_tokens)
         try:
             result = runtime.generate(prompt, max_tokens=max_tokens, prefill_step_size=1024)
+            _print_execution_route(runtime, adapter._mtp_enabled)
         finally:
             restore()
 

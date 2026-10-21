@@ -101,6 +101,7 @@ paged/block cache、prefix sharing、Copy-on-Write、SSD tiering 和 continuous 
 | Q4 MLP dispatch wrapper 去重 | 已尝试/暂不采用 | 当前 4K benchmark 未显示收益且 TPOT/TG TPS 回退 | 不进入默认路径 |
 | Full-Attention KVCache preallocation | 降级/暂缓 | oMLX 的主要 KV 优化是服务层分页、共享和 SSD tiering；单请求预分配不是其核心差异点 | 保留诊断工具，不作为当前主线 |
 | GDN Q4 prefill projection native path | 暂缓/未来候选 | 两个 JIT probe 均不等价于 oMLX 的 compiled MLX primitive；但当前 MiniMLX 与 oMLX 的 Prefill 差距约 2%–4%，native extension 的潜在收益不足以覆盖 MLX ABI、版本适配和维护成本 | 不进入当前优化循环；保留研究记录，未来在 MLX 版本稳定或出现更大收益证据时复评 |
+| 普通单请求 GDN Decode recurrence 融合 | 已完成/无可测收益 | Qwen3.8-27B 固定 128-token A/B：自定义 recurrence 与基线 token hash 一致；1K +0.22%、4K +0.06%，低于运行噪声。手写 gate 的 BF16 数值校验失败 | 默认关闭；opt-in 只保留为可复现对照，不作为优化收益。后续仅在新 profile 或公开实现证据指向不同热点时再研究 GDN |
 
 ### 原计划完成状态
 

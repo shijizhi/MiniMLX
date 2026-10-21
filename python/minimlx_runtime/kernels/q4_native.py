@@ -78,7 +78,8 @@ def install_q4_native_prefill(model, min_tokens: int = 2048) -> int:
 
     def dispatch(projection, value, *args, **kwargs):
         if (
-            getattr(projection, "_minimlx_q4_native_prefill", False)
+            os.environ.get("MINIMLX_DISABLE_Q4_NATIVE_RUNTIME") != "1"
+            and getattr(projection, "_minimlx_q4_native_prefill", False)
             and not args
             and not kwargs
             and getattr(value, "ndim", 0) == 3

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "swift_banner_single",
+    "images": ["fixtures/swift-t-banner.png"],
+    "prompt": "Read the visible words in this image and return only the words.",
+    "expect": ["Swift", "Transformers"],
+    "max_tokens": 8
+  },
+  {
+    "name": "swift_banner_multi",
+    "images": ["fixtures/swift-t-banner.png", "fixtures/swift-t-banner.png"],
+    "prompt": "Read the visible words in both images and return only the words.",
+    "expect": ["Swift"],
+    "max_tokens": 8
+  }
+]

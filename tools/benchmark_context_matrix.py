@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -50,6 +51,32 @@ def apply_runtime_config(config: dict[str, object]) -> None:
     )
 
 
+def make_omlx_aligned_prompt(tokenizer, max_context: int) -> str:
+    """Build the deterministic Python continuation prompt used by oMLX's paired benchmark."""
+    seed = (
+        "def process_batch(items):\n"
+        "    results = []\n"
+        "    for item in items:\n"
+        "        value = transform(item)\n"
+        "        results.append(value)\n"
+        "    return results\n\n"
+    )
+    source = seed * max(1000, max_context // 8)
+    token_ids = list(tokenizer.encode(source, add_special_tokens=False))
+    if len(token_ids) < max_context:
+        raise RuntimeError(
+            f"aligned prompt seed is too short: {len(token_ids)} < {max_context}"
+        )
+    prompt = tokenizer.decode(token_ids[:max_context])
+    aligned_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
+    if len(aligned_ids) != max_context:
+        raise RuntimeError(
+            "oMLX aligned prompt failed round-trip: "
+            f"expected {max_context}, got {len(aligned_ids)}"
+        )
+    return prompt
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "config" / "minimlx.local.json"
@@ -65,6 +92,47 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=config.get("warmup", 32))
     parser.add_argument("--max-tokens", type=int, default=config.get("max_tokens", 128))
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="force the decode to max_tokens; use for apples-to-apples throughput comparison",
+    )
+    parser.add_argument(
+        "--omlx-aligned-prompt",
+        action="store_true",
+        help="use oMLX/PyMiniMLX's deterministic token-aligned Python prompt",
+    )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="force Qwen3.x text requests through mlx-lm instead of the MLLM/VLM lane",
+    )
+    parser.add_argument(
+        "--mtp-draft-model",
+        type=str,
+        help=(
+            "paired Qwen3.5 MTP draft checkpoint; enables the isolated "
+            "MLX-VLM MTP backend"
+        ),
+    )
+    parser.add_argument(
+        "--dflash-draft-model",
+        type=str,
+        help="paired DFlash draft checkpoint; enables block-diffusion speculative decoding",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        choices=(4, 8),
+        help="opt-in KV cache quantization for long-context decode",
+    )
+    parser.add_argument(
+        "--kv-start",
+        type=int,
+        default=512,
+        help="token offset at which opt-in KV cache quantization begins",
+    )
+    parser.add_argument("--repeats", type=int, default=1, help="measured runs per context; report the median")
     parser.add_argument(
         "--step",
         type=int,
@@ -101,6 +169,28 @@ def main() -> None:
         help="Compare stock and OMLX-derived fused GDN verify prework; checks token equality.",
     )
     args = parser.parse_args()
+    if args.repeats < 1:
+        parser.error("--repeats must be at least 1")
+    if args.ignore_eos:
+        os.environ["MINIMLX_IGNORE_EOS"] = "1"
+    if args.omlx_aligned_prompt:
+        os.environ["MINIMLX_RAW_COMPLETION"] = "1"
+    if args.text_only:
+        os.environ["MINIMLX_FORCE_TEXT_RUNTIME"] = "1"
+    if args.mtp_draft_model:
+        os.environ["MINIMLX_MTP_DRAFT_MODEL"] = args.mtp_draft_model
+        # MTP uses the coherent MLX-VLM target/cache/verifier stack. Do not let
+        # the ordinary text-only override select the mlx-lm backend first.
+        os.environ.pop("MINIMLX_FORCE_TEXT_RUNTIME", None)
+    if args.dflash_draft_model:
+        if args.mtp_draft_model:
+            parser.error("choose either --mtp-draft-model or --dflash-draft-model")
+        os.environ["MINIMLX_DFLASH_DRAFT_MODEL"] = args.dflash_draft_model
+        os.environ["MINIMLX_FORCE_TEXT_RUNTIME"] = "1"
+    if args.kv_bits is not None:
+        os.environ["MINIMLX_KV_CACHE_BITS"] = str(args.kv_bits)
+        os.environ["MINIMLX_QUANTIZED_KV_START"] = str(args.kv_start)
+    os.environ.setdefault("MINIMLX_PREFILL_SKIP_LOGITS", "1")
 
     experiments = sum(
         bool(value)
@@ -126,9 +216,20 @@ def main() -> None:
         os.environ["MINIMLX_MTP_VERIFY_AB"] = "1"
         os.environ["MINIMLX_MTP_FORCE_FUSED_VERIFY"] = "0"
 
-    prompt = Path(args.prompt_file).read_text()
     runtime = Runtime()
     runtime.load(args.model_dir)
+    if args.omlx_aligned_prompt:
+        prompt = make_omlx_aligned_prompt(
+            adapter_tokenizer := runtime.adapter.tokenizer,
+            max(args.contexts),
+        )
+        print(
+            f"prompt protocol (oMLX-aligned Python raw completion, "
+            f"max_context_tokens={max(args.contexts)})"
+        )
+    else:
+        prompt = Path(args.prompt_file).read_text()
+        print("prompt protocol (corpus file)")
 
     def timed_generate(*args, **kwargs):
         start = time.perf_counter()
@@ -137,34 +238,61 @@ def main() -> None:
 
     print(
         "MiniMLX context matrix "
-        f"(warmup={args.warmup} tokens at context=2048, measured_runs=1, step={args.step})"
+        f"(warmup={args.warmup} tokens at context=2048, measured_runs={args.repeats}, step={args.step})"
     )
     print(
         "runtime kernels "
         f"(q4_native={config.get('enable_q4_native_prefill', False)}, "
         f"fa256_native={config.get('enable_native_fa256_prefill', False)}, "
-        f"q4_dense_disabled={config.get('disable_q4_prefill_dense', False)}, "
+        f"q4_dense_disabled={config.get('disable_q4_prefill_dense', False) or os.environ.get('MINIMLX_ENABLE_Q4_NATIVE_PREFILL') == '1'}, "
         f"q4_mlp_fusion_disabled={config.get('disable_q4_mlp_fusion', False)})"
     )
     adapter = runtime.adapter
     mtp_enabled = bool(getattr(adapter, "_mtp_enabled", False))
+    dflash_enabled = bool(getattr(adapter, "_dflash_enabled", False))
     mtp_draft_path = os.environ.get("MINIMLX_MTP_DRAFT_MODEL")
     if mtp_draft_path and not mtp_enabled:
         raise RuntimeError(
             "MINIMLX_MTP_DRAFT_MODEL was set, but the loaded adapter did not "
             "enable MTP; refusing to report an autoregressive run as an MTP benchmark."
         )
+    dflash_draft_path = os.environ.get("MINIMLX_DFLASH_DRAFT_MODEL")
+    if dflash_draft_path and not dflash_enabled:
+        raise RuntimeError(
+            "MINIMLX_DFLASH_DRAFT_MODEL was set, but the loaded adapter did not "
+            "enable DFlash; refusing to report an autoregressive run as a DFlash benchmark."
+        )
     print(
         "decode backend "
-        f"({'Qwen3.5 MTP' if mtp_enabled else 'autoregressive'}"
+        f"({'DFlash' if dflash_enabled else 'Qwen3.5 MTP' if mtp_enabled else 'autoregressive'}"
         + (
-            f", draft={Path(mtp_draft_path).name}, "
+            f", draft={Path(dflash_draft_path).name}, "
+            f"block_size={min(getattr(getattr(adapter._dflash_draft_model, 'config', None), 'block_size', 5), int(os.environ.get('MINIMLX_DFLASH_BLOCK_SIZE', '5')))}"
+            if dflash_enabled and dflash_draft_path
+            else f", draft={Path(mtp_draft_path).name}, "
             f"block_size={getattr(getattr(adapter._mtp_draft_model, 'config', None), 'block_size', 'default')}"
             if mtp_enabled and mtp_draft_path
             else ""
         )
         + ")"
     )
+    print(
+        "runtime route "
+        f"({'text-only mlx-lm' if not getattr(adapter, '_vlm_enabled', False) else 'mlx-vlm/MLLM'})"
+    )
+    print(
+        "prefill/decode options ("
+        f"skip_intermediate_logits_requested={os.environ.get('MINIMLX_PREFILL_SKIP_LOGITS') == '1'}, "
+        f"kv_bits={os.environ.get('MINIMLX_KV_CACHE_BITS', 'off')}, "
+        f"kv_start={os.environ.get('MINIMLX_QUANTIZED_KV_START', 'n/a')})"
+    )
+    raw_eos_ids = getattr(adapter.tokenizer, "eos_token_ids", ())
+    if raw_eos_ids is None:
+        raw_eos_ids = ()
+    elif isinstance(raw_eos_ids, int):
+        raw_eos_ids = (raw_eos_ids,)
+    eos_ids = sorted(int(token) for token in raw_eos_ids)
+    print(f"generation stop policy (ignore_eos={args.ignore_eos}, eos_ids={eos_ids})")
     # Match oMLX Quick warm-up: compile/exercise one 2K-context request before
     # timing the matrix, rather than warming every measured context separately.
     runtime.generate(
@@ -224,7 +352,17 @@ def main() -> None:
                          prefill_step_size=args.step)
         os.environ["MINIMLX_MTP_GDN_PREWORK"] = "0"
 
+    try:
+        import mlx.core as mx
+    except ImportError:
+        mx = None
+    context_peak_memory = []
+
     for context_index, context in enumerate(args.contexts):
+        if mx is not None and hasattr(mx, "reset_peak_memory"):
+            # Match oMLX's per-request memory reporting.  Keep model weights
+            # resident as the baseline, but measure each context independently.
+            mx.reset_peak_memory()
         if args.mtp_gdn_ab:
             from minimlx_runtime.kernels.mtp_gdn_prework import (
                 mtp_gdn_prework_routes, reset_mtp_gdn_prework_routes,
@@ -384,7 +522,12 @@ def main() -> None:
                 mx.eval([entry.state for entry in cache if entry is not None])
             if hidden is None:
                 raise RuntimeError("cannot compare MTP with AR for an empty prompt")
-            eos_ids = set(getattr(adapter.tokenizer, "eos_token_ids", ()) or ())
+            raw_eos_ids = getattr(adapter.tokenizer, "eos_token_ids", ())
+            if raw_eos_ids is None:
+                raw_eos_ids = ()
+            elif isinstance(raw_eos_ids, int):
+                raw_eos_ids = (raw_eos_ids,)
+            eos_ids = {int(token) for token in raw_eos_ids}
             target_ar_tokens = []
             token_array = lm.speculative_argmax_from_hidden(hidden[:, -1:, :])
             if token_array is None:
@@ -515,7 +658,6 @@ def main() -> None:
                 reset_mtp_verify_fused_attention_stats,
             )
 
-            reset_mtp_verify_fused_attention_stats()
         gdn_routes = None
         if mtp_enabled:
             from minimlx_runtime.kernels.mtp_gdn_prework import (
@@ -527,31 +669,65 @@ def main() -> None:
                 reset_mtp_vlm_gdn_prefill_stats,
             )
 
-            reset_mtp_gdn_prework_routes()
-            reset_mtp_vlm_gdn_prefill_stats()
-        result, e2e_ms = timed_generate(
-            prompt,
-            max_tokens=args.max_tokens,
-            context_tokens=context,
-            prefill_step_size=args.step,
-        )
+        measurements = []
+        for repeat in range(args.repeats):
+            if mtp_enabled:
+                reset_mtp_verify_fused_attention_stats()
+                reset_mtp_gdn_prework_routes()
+                reset_mtp_vlm_gdn_prefill_stats()
+            result, e2e_ms = timed_generate(
+                prompt,
+                max_tokens=args.max_tokens,
+                context_tokens=context,
+                prefill_step_size=args.step,
+            )
+            generated_tokens = len(result.generated_tokens)
+            if len(result.prompt_tokens) != context or not 0 < generated_tokens <= args.max_tokens:
+                raise RuntimeError(
+                    f"shape mismatch at context={context}, repeat={repeat + 1}: "
+                    f"prompt={len(result.prompt_tokens)} "
+                    f"generated={generated_tokens} max_tokens={args.max_tokens}"
+                )
+            measurements.append({
+                "ttft": result.prefill_ms,
+                "decode": result.decode_ms,
+                "tpot": result.decode_ms / (generated_tokens - 1) if generated_tokens > 1 else 0.0,
+                "pp_tps": context * 1000.0 / result.prefill_ms if result.prefill_ms > 0 else 0.0,
+                "tg_tps": generated_tokens * 1000.0 / result.decode_ms if result.decode_ms > 0 else 0.0,
+                "generated": generated_tokens,
+                "e2e": e2e_ms,
+                "first_token": int(result.generated_tokens[0]),
+                "first_token_text": adapter.tokenizer.decode(result.generated_tokens[:1]),
+                "first_token_is_eos": int(result.generated_tokens[0]) in set(eos_ids),
+            })
         if mtp_enabled:
             gdn_routes = mtp_gdn_prework_routes()
             gdn_prefill_routes, gdn_prefill_fallbacks = mtp_vlm_gdn_prefill_stats()
-        if len(result.prompt_tokens) != context or len(result.generated_tokens) != args.max_tokens:
-            raise RuntimeError(
-                f"shape mismatch at context={context}: "
-                f"prompt={len(result.prompt_tokens)} generated={len(result.generated_tokens)}"
-            )
-        prefill_ms = result.prefill_ms
-        decode_ms = result.decode_ms
-        tpot_ms = decode_ms / (args.max_tokens - 1) if args.max_tokens > 1 else 0.0
+        median = {key: statistics.median(sample[key] for sample in measurements) for key in measurements[0]}
         print(
-            f"context={context} TTFT={prefill_ms:.1f} ms "
-            f"TPOT={tpot_ms:.2f} ms "
-            f"TG_TPS={args.max_tokens * 1000.0 / decode_ms:.2f} "
-            f"E2E={e2e_ms:.1f} ms"
+            f"context={context} TTFT={median['ttft']:.1f} ms "
+            f"TPOT={median['tpot']:.2f} ms "
+            f"PP_TPS={median['pp_tps']:.1f} "
+            f"TG_TPS={median['tg_tps']:.2f} "
+            f"generated={median['generated']}/{args.max_tokens} "
+            f"first_token={median['first_token']} "
+            f"first_token_is_eos={bool(median['first_token_is_eos'])} "
+            f"E2E={median['e2e']:.1f} ms statistic=median"
         )
+        print("  samples=" + "; ".join(
+            f"{sample['ttft']:.1f}/{sample['tpot']:.2f}/{sample['pp_tps']:.1f}/{sample['tg_tps']:.2f}/{sample['e2e']:.1f}"
+            for sample in measurements
+        ) + " (TTFT ms / TPOT ms / PP TPS / TG TPS / E2E ms)")
+        if mx is not None:
+            active = getattr(mx, "get_active_memory", None)
+            peak = getattr(mx, "get_peak_memory", None)
+            if callable(active) and callable(peak):
+                peak_bytes = peak()
+                context_peak_memory.append(peak_bytes)
+                print(
+                    f"  memory active={active() / (1024**3):.3f} GiB "
+                    f"peak={peak_bytes / (1024**3):.3f} GiB"
+                )
         if mtp_enabled:
             trace = getattr(adapter, "_mtp_last_round_trace", ())
             rounds = len(trace)
@@ -567,6 +743,17 @@ def main() -> None:
                 f"gdn_prefill_routes={gdn_prefill_routes} "
                 f"gdn_prefill_fallbacks={gdn_prefill_fallbacks}"
             )
+
+    try:
+        import mlx.core as mx
+
+        if context_peak_memory:
+            suite_peak = max(context_peak_memory)
+        else:
+            suite_peak = mx.get_peak_memory()
+        print(f"suite_peak_memory_gib={suite_peak / (1024**3):.3f}")
+    except (ImportError, AttributeError):
+        print("suite_peak_memory_gib=unavailable")
 
 
 if __name__ == "__main__":

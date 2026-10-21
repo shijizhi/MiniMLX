@@ -1,5 +1,44 @@
 # Prefix cache research
 
+## Shared VLM APC experiment (2026-10-13; initial hardware run)
+
+The pinned `mlx-vlm` source in MiniMLX's `.venv` exposes an `APCManager` and an
+`apc_manager` argument on its shared generation entry point. Its coordinator
+does block-prefix lookup, checks model/cache compatibility, and computes a
+semantic hash that includes media inputs; unsafe or unsupported prefixes fall
+back to normal prefill. This is the reusable serving-layer direction seen in
+LM Studio and Rapid-MLX, not a Qwen3.8-specific inference path.
+
+MiniMLX now passes that upstream manager through the shared `MLXVLMAdapter`
+when explicitly enabled with `MINIMLX_ENABLE_VLM_APC=1`. This experiment is
+model-instance-local, memory-bounded by `MINIMLX_VLM_APC_MEMORY_GB`, and keeps
+disk persistence disabled. Prefix-cache hit/token/byte counters are exposed in
+runtime metrics. The default remains off; existing session `PromptCacheState`
+behavior is unchanged. Qwen3.8 uses this via its existing shared VLM route.
+
+Run the text-only A/B on a VLM checkpoint with Metal available:
+
+```bash
+PYTHONPATH=python ./.venv/bin/python tools/experiment_vlm_apc.py \
+  /Users/jizhishi/.minimlx/models/mlx-community--Qwen3.8-27B-4bit \
+  Resources/BenchmarkCorpus/code_python.txt \
+  --prompt-chars 8000 --max-tokens 8 --warmup 0 --repeats 1 --memory-gb 1
+```
+
+The tool compares equal-sized workloads: `repeats + 1` uncached calls versus
+one APC population call plus `repeats` prefix-reuse calls. It reports both the
+per-request hit speedup and end-to-end workload speedup including cache-fill
+cost. It requires identical generated token IDs and an observed cache hit.
+One initial Qwen3.8-27B run observed 2,159 matched tokens out of 2,160, identical
+generated token IDs, and about 8.9x lower latency for the hit request; the
+cache-population cost was not included in that original per-request ratio. A
+follow-up run with the updated equal-workload accounting is needed for an
+end-to-end figure. A successful MiniMLX A/B is still not an oMLX comparison;
+use the same prompt and serving configuration for the separately measured
+oMLX arm before making a cross-runtime claim. Follow-up coverage should include
+4K/16K/32K prompts and image prompts, plus memory and cache-lifecycle checks,
+before considering broader enablement.
+
 ## Why this is the next target
 
 The current MiniMLX adapter creates a fresh model cache for every generation

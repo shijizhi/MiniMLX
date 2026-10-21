@@ -86,6 +86,42 @@ impl PythonWorker {
         decode_response(line.as_bytes())
     }
 
+    /// Send a streaming inference request and collect its delta/done events.
+    pub fn request_stream(&self, request: &Request) -> Result<Vec<Response>, SupervisorError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stream = loop {
+            match UnixStream::connect(&self.socket_path) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(SupervisorError::Start(error)),
+            }
+        };
+        stream.write_all(&Self::encode_request(request)?)?;
+        stream.flush()?;
+        let mut reader = BufReader::new(stream);
+        let mut responses = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let response = decode_response(line.as_bytes())?;
+            let done = matches!(
+                &response.payload,
+                minimlx_protocol::ResponsePayload::InferenceStream { event, .. }
+                    if event == "done"
+            );
+            responses.push(response);
+            if done {
+                break;
+            }
+        }
+        Ok(responses)
+    }
+
     pub fn encode_request(request: &Request) -> Result<Vec<u8>, SupervisorError> {
         let mut bytes = serde_json::to_vec(request)?;
         bytes.push(b'\n');

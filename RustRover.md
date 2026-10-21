@@ -36,15 +36,28 @@ config/minimlx.local.json
 
 也可以通过环境变量 `MINIMLX_CONFIG` 指定另一份配置文件。
 
-当前 binary 会启动 Python MLX worker，通过 Unix Domain Socket 发出一次
-生成请求，并把生成文本和 tok/s 打印到 RustRover Run 窗口。
+直接 Run（无参数）或传入 `--gui` 会打开 GPUI 桌面界面。模型页扫描配置目录，
+可加载/卸载模型，也可从 Hugging Face 或 ModelScope 下载；后两者需要在项目
+venv 中安装对应可选依赖。性能页运行 MiniMLX context matrix 并把完整输出保存在
+`Reports/Performance/`。API 页启动/停止本机 OpenAI-compatible 服务
+（`127.0.0.1:8000/v1`）。总览中的系统内存每 2 秒刷新；macOS 不提供可用的
+通用 GPU 利用率接口，因此该项明确显示不可用，不显示模拟数据。
 
-默认 `config/minimlx.local.json` 的 `mode` 是 `benchmark`，所以直接点击
-Run 会执行与 oMLX 单请求界面对齐的测试：代码文本、上下文 4096 tokens、
-生成 128 tokens、Quick warmup 32（一次 warm-up 请求，生成 32 tokens）。改为
-`"mode": "generate"` 就会执行单次生成。GPUI 窗口会复用同一个
-supervisor 和协议层接入。
+可选下载依赖：
 
-当前 Run 先覆盖截图中的单请求基准。截图中的 batch=2/4 属于
-continuous batching，必须由 Python scheduler 真正同时调度多个请求后再加入，
-不会用串行调用伪装成 batch 结果。
+```bash
+./.venv/bin/pip install -e '.[download-huggingface]'
+./.venv/bin/pip install -e '.[download-modelscope]'
+```
+
+OpenAI-compatible 服务支持 `/v1/models`、`/v1/chat/completions` 和
+`/v1/completions`。文本流式响应遵循 SSE 格式，但当前以完整生成结果缓冲后发送；
+Qwen3.5 视觉流式响应使用 runtime 的增量事件路径。
+
+要运行已有命令行推理/基准流程，请给 binary 传入 CLI 参数，例如：
+
+```text
+--mode generate --prompt "Explain MLX" --max-tokens 32
+```
+
+CLI benchmark 仅测试 MiniMLX runtime，不会启动或调用 oMLX。

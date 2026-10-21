@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:minimlx:schema:model-support-record:v1",
+  "title": "MiniMLX model support record",
+  "description": "One task/modality/family/format/backend/hardware support-state entry with reproducible evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "key",
+    "state",
+    "revision",
+    "provider_version",
+    "backend_versions",
+    "hardware_profile",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task",
+        "input_modalities",
+        "output_modalities",
+        "family",
+        "format",
+        "backend",
+        "hardware_profile"
+      ],
+      "properties": {
+        "task": {
+          "enum": [
+            "generation",
+            "embedding",
+            "reranking",
+            "speech_to_text",
+            "text_to_speech",
+            "speech_to_speech"
+          ]
+        },
+        "input_modalities": { "$ref": "#/$defs/modalities" },
+        "output_modalities": { "$ref": "#/$defs/modalities" },
+        "family": { "type": "string", "minLength": 1 },
+        "format": { "type": "string", "minLength": 1 },
+        "backend": { "type": "string", "minLength": 1 },
+        "hardware_profile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "state": {
+      "enum": [
+        "discovered",
+        "classified",
+        "loadable",
+        "smoke_pass",
+        "task_correct",
+        "context_or_shape_pass",
+        "benchmarked",
+        "unsupported",
+        "ambiguous",
+        "missing_component",
+        "dependency_blocked",
+        "hardware_blocked"
+      ]
+    },
+    "revision": { "type": "string", "minLength": 1 },
+    "provider_version": { "type": "string", "minLength": 1 },
+    "backend_versions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "hardware_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine", "os"],
+      "properties": {
+        "machine": { "type": "string", "minLength": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "unified_memory_bytes": { "type": "integer", "minimum": 1 },
+        "accelerators": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "modalities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["text", "image", "audio", "video", "structured"]
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "result", "summary", "command"],
+      "properties": {
+        "state": {
+          "enum": [
+            "discovered",
+            "classified",
+            "loadable",
+            "smoke_pass",
+            "task_correct",
+            "context_or_shape_pass",
+            "benchmarked",
+            "unsupported",
+            "ambiguous",
+            "missing_component",
+            "dependency_blocked",
+            "hardware_blocked"
+          ]
+        },
+        "result": { "enum": ["pass", "fail", "blocked", "not_run"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "command": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "recorded_at": { "type": "string", "format": "date-time" },
+        "artifact": { "type": "string", "minLength": 1 },
+        "metrics": { "type": "object", "additionalProperties": { "type": "number" } }
+      }
+    }
+  }
+}

@@ -1,5 +1,8 @@
 # MiniMLX Runtime Architecture
 
+> 早期 runtime 架构记录。当前权威的全任务/全模态分层和实施路线见
+> [`Universal_Model_Support_Architecture.md`](Universal_Model_Support_Architecture.md)。
+
 ## 目标
 
 MiniMLX 的目标不是复刻 oMLX 的通用服务，而是构建一个面向 Apple Silicon 的高性能本地推理 runtime：

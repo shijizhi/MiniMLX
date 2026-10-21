@@ -218,6 +218,8 @@ def install_native_fa256_prefill(min_query_tokens: int = 1024) -> bool:
         stock = base.scaled_dot_product_attention
 
         def patched(queries, keys, values, cache, scale, mask, sinks=None, _stock=stock):
+            if os.environ.get("MINIMLX_DISABLE_NATIVE_FA256_RUNTIME") == "1":
+                return _stock(queries, keys, values, cache, scale, mask, sinks)
             if eligible(queries, keys, values, cache, mask, sinks):
                 try:
                     signature = (int(queries.shape[2]), int(keys.shape[2]))

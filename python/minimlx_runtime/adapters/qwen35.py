@@ -3,14 +3,90 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import time
-from typing import Any
+import hashlib
+from threading import RLock
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-from ..types import ExecutionPlan, ModelDescriptor
+from ..types import Acceleration, ExecutionPlan, ModelDescriptor, Modality
 from ..scheduling import choose_prefill_step_size
-from ..prompt_cache import PrefixCache
+from ..vision_cache import VisionInputCache
+from .mlx_vlm import MLXVLMAdapter, _apply_vlm_chat_template, _video_input
 
 
-class Qwen35Adapter:
+_DFLASH_DRAFT_LOAD_LOCK = RLock()
+
+if TYPE_CHECKING:
+    from ..prompt_cache import PrefixCache
+
+
+def _token_ids_as_set(value: Any) -> set[int]:
+    """Normalize tokenizer EOS metadata, which varies between backends."""
+    if value is None:
+        return set()
+    if isinstance(value, int):
+        return {int(value)}
+    return {int(token) for token in value}
+
+
+def _cleanup_failed_mtp_request(mx: Any, stream: Any, reset_drafter: Any, target: Any,
+                                target_cache: list[Any], shared_kv: dict) -> None:
+    """Retire request-local MTP state after a failed speculative decode.
+
+    Synchronize before dropping cache arrays so lazy Metal work cannot outlive
+    the request. Resetting the drafter also detaches its request-local cache;
+    cleanup failures must not replace the original inference exception.
+    """
+    try:
+        mx.synchronize(stream)
+    except Exception:
+        pass
+    try:
+        reset_drafter(target)
+    except Exception:
+        pass
+    target_cache.clear()
+    shared_kv.clear()
+    try:
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+@dataclass(frozen=True)
+class PreparedVisionInputs:
+    """Backend-neutral boundary before VLM prefill/feature injection."""
+
+    prompt: str
+    input_ids: Any
+    pixel_values: Any | None
+    attention_mask: Any | None
+    extra: dict[str, Any]
+
+
+def _vlm_phase_timings(
+    *,
+    prompt_tokens: int,
+    generated_tokens: int,
+    prompt_tokens_per_second: float,
+    generation_tokens_per_second: float,
+    elapsed_ms: float,
+) -> tuple[float, float]:
+    """Convert mlx-vlm's per-phase rates into MiniMLX latency metrics."""
+    prefill_ms = (
+        prompt_tokens * 1000.0 / prompt_tokens_per_second
+        if prompt_tokens_per_second > 0
+        else elapsed_ms
+    )
+    decode_ms = (
+        generated_tokens * 1000.0 / generation_tokens_per_second
+        if generation_tokens_per_second > 0
+        else max(0.0, elapsed_ms - prefill_ms)
+    )
+    return prefill_ms, decode_ms
+
+
+class Qwen35Adapter(MLXVLMAdapter):
     """First model-family adapter, backed by MiniMLX's own MLX-LM venv.
 
     PyMiniMLX is a reference project only and is deliberately not imported.
@@ -21,27 +97,70 @@ class Qwen35Adapter:
     name = "qwen35-mlx-lm"
 
     def __init__(self) -> None:
+        super().__init__()
         self.model: Any | None = None
         self.tokenizer: Any | None = None
+        self.processor: Any | None = None
         self.descriptor: ModelDescriptor | None = None
         self._ane_projection: Any | None = None
         self._ane_gdn_stage: Any | None = None
         self._prefix_cache: PrefixCache | None = None
         self._session_prefix_caches: dict[str, PrefixCache] = {}
+        self._vlm_prompt_cache_states = self._prompt_cache_states
         self._greedy_skip_logsumexp = False
+        self._qwen35_skip_logits_class: Any | None = None
+        self._qwen35_skip_logits_original: Any | None = None
         self._prefill_keep_allocator_cache = False
         self._mtp_draft_model: Any | None = None
         self._mtp_enabled = False
+        self._dflash_draft_model: Any | None = None
+        self._dflash_enabled = False
+        self._mtp_target_language_model: Any | None = None
+        self._mtp_argmax_hook: Any | None = None
         self._mtp_last_round_trace: list[dict[str, Any]] = []
+        self._vlm_enabled = False
+        self._vision_input_cache = VisionInputCache(
+            int(os.environ.get("MINIMLX_VISION_INPUT_CACHE_MAX_BYTES", "0"))
+        )
+        self._vision_feature_cache: Any | None = None
+        self._vision_feature_cache_hits = 0
+        self._vision_feature_cache_misses = 0
+        self._vision_feature_cache_stores = 0
 
     def can_load(self, descriptor: ModelDescriptor) -> bool:
         value = f"{descriptor.model_type} {descriptor.architecture}".lower()
         return "qwen3" in value and "5" in value
 
-    def load(self, descriptor: ModelDescriptor) -> "Qwen35Adapter":
-        mtp_draft_path = os.environ.get("MINIMLX_MTP_DRAFT_MODEL")
+    @staticmethod
+    def _mtp_draft_path(plan: ExecutionPlan | None) -> str | None:
+        if plan is None or Acceleration.MTP not in plan.accelerations:
+            return None
+        return plan.acceleration_components.get(Acceleration.MTP)
+
+    @staticmethod
+    def _dflash_draft_path(plan: ExecutionPlan | None) -> str | None:
+        if plan is None or Acceleration.DFLASH not in plan.accelerations:
+            return None
+        return plan.acceleration_components.get(Acceleration.DFLASH)
+
+    def load(
+        self, descriptor: ModelDescriptor, plan: ExecutionPlan | None = None
+    ) -> "Qwen35Adapter":
+        # Qwen3.8 checkpoints advertise a vision-capable architecture even
+        # when the request is text-only.  Rapid-MLX has a separate
+        # ``--no-mllm`` lane for this exact case; keep the VLM backend for
+        # media requests, but allow text benchmarks/serving to force the
+        # lighter mlx-lm path.
+        if (
+            plan is not None
+            and plan.backend_adapter == "qwen35-vlm"
+            and os.environ.get("MINIMLX_FORCE_TEXT_RUNTIME") != "1"
+        ):
+            return self._load_vlm_backend(descriptor, plan)
+        mtp_draft_path = self._mtp_draft_path(plan)
         if mtp_draft_path:
             return self._load_mtp_backend(descriptor, mtp_draft_path)
+        dflash_draft_path = self._dflash_draft_path(plan)
 
         try:
             from mlx_lm import load
@@ -57,8 +176,44 @@ class Qwen35Adapter:
             ) from exc
         self.model, self.tokenizer = load(descriptor.model_dir)
         self.descriptor = descriptor
+        if dflash_draft_path:
+            try:
+                from dflash import model_mlx
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise RuntimeError(
+                    "DFlash acceleration requires the 'dflash' package in MiniMLX's .venv; "
+                    "install it with `pip install dflash` and restart the runtime."
+                ) from exc
+            # The upstream MLX loader accepts Hub IDs; MiniMLX stores complete
+            # checkpoints in its own model directory. Redirect just the
+            # snapshot resolver while loading, then restore it immediately.
+            with _DFLASH_DRAFT_LOAD_LOCK:
+                original_snapshot_download = model_mlx.snapshot_download
+                model_mlx.snapshot_download = lambda _repo, **_kwargs: str(
+                    Path(dflash_draft_path).expanduser().resolve()
+                )
+                try:
+                    self._dflash_draft_model = model_mlx.load_draft(dflash_draft_path)
+                finally:
+                    model_mlx.snapshot_download = original_snapshot_download
+            self._dflash_enabled = True
+        self._install_qwen35_skip_logits()
+        self._install_gdn_decode_conv_silu(self.model)
+        if (
+            os.environ.get("MINIMLX_GDN_DECODE_CUSTOM_RECURRENCE") == "1"
+            or os.environ.get("MINIMLX_GDN_DECODE_FUSED_QK_NORM") == "1"
+        ):
+            from ..kernels.gdn_decode import install_gdn_decode_custom_recurrence
+
+            if not install_gdn_decode_custom_recurrence():
+                raise RuntimeError("GDN recurrence experiment could not install its dispatch hooks")
         self._install_gdn_prefill_kernel()
-        self._install_q4_mlp_prefill_dense()
+        # Native Q4 MLP already performs the long-prefill projections from the
+        # packed weights.  Do not also materialize BF16 gate/up/down copies:
+        # for this 27B checkpoint that would retain roughly 30 GiB of duplicate
+        # weights and make the text-only route look much larger than oMLX.
+        if os.environ.get("MINIMLX_ENABLE_Q4_NATIVE_PREFILL") != "1":
+            self._install_q4_mlp_prefill_dense()
         self._install_q4_native_prefill()
         self._install_q4_native_mlp()
         self._install_q4_mlp_prefill_fusion()
@@ -80,9 +235,325 @@ class Qwen35Adapter:
             "MINIMLX_PREFILL_KEEP_ALLOCATOR_CACHE"
         ) == "1"
         if os.environ.get("MINIMLX_ENABLE_PREFIX_CACHE") == "1":
+            from ..prompt_cache import PrefixCache
+
             max_bytes = int(os.environ.get("MINIMLX_PREFIX_CACHE_MAX_BYTES", str(4 * 1024**3)))
             self._prefix_cache = PrefixCache(self.model, max_bytes)
         return self
+
+    def unload(self) -> None:
+        """Drop model/session references so the runtime can reclaim device memory."""
+        if self.model is not None:
+            import sys
+
+            fusion = sys.modules.get("minimlx_runtime.kernels.gdn_conv_silu")
+            if fusion is not None:
+                fusion.restore_gdn_decode_conv_silu(self.model)
+        if (
+            self._qwen35_skip_logits_class is not None
+            and self._qwen35_skip_logits_original is not None
+        ):
+            self._qwen35_skip_logits_class.__call__ = (
+                self._qwen35_skip_logits_original
+            )
+            self._qwen35_skip_logits_class._minimlx_skip_logits_installed = False
+            self._qwen35_skip_logits_class = None
+            self._qwen35_skip_logits_original = None
+        self._session_prefix_caches.clear()
+        self._vlm_prompt_cache_states.clear()
+        self._prefix_cache = None
+        self._mtp_last_round_trace.clear()
+        self._mtp_draft_model = None
+        self._dflash_draft_model = None
+        self._dflash_enabled = False
+        self._mtp_target_language_model = None
+        self._mtp_argmax_hook = None
+        self.tokenizer = None
+        self.model = None
+        self.processor = None
+        self._vision_input_cache.clear()
+        if self._vision_feature_cache is not None:
+            self._vision_feature_cache.clear()
+        self._vision_feature_cache = None
+        self._vision_feature_cache_hits = 0
+        self._vision_feature_cache_misses = 0
+        self._vision_feature_cache_stores = 0
+        self.descriptor = None
+        self._ane_projection = None
+        self._ane_gdn_stage = None
+        self._mtp_enabled = False
+        self._vlm_enabled = False
+        self._greedy_skip_logsumexp = False
+        self._prefill_keep_allocator_cache = False
+        # Avoid importing MLX in headless use. Clearing its allocator cache after
+        # dropping this adapter's references lets Metal reclaim released buffers.
+        import sys
+
+        mx = sys.modules.get("mlx.core")
+        if mx is not None:
+            mx.clear_cache()
+
+    def _install_qwen35_skip_logits(self) -> None:
+        """Allow long-prefill chunks to update cache without materializing logits.
+
+        mlx-lm 0.31.x's Qwen3.5 text wrapper always applies lm_head, while the
+        long greedy prefill path only needs the cache state.  The model's inner
+        transformer already returns hidden states, so expose that narrow option
+        without changing the stock call contract used by normal generation.
+        """
+        if os.environ.get("MINIMLX_PREFILL_SKIP_LOGITS", "1") != "1":
+            return
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is None or not hasattr(language_model, "model"):
+            return
+        model_type = type(language_model)
+        if getattr(model_type, "_minimlx_skip_logits_installed", False):
+            return
+        stock_call = model_type.__call__
+
+        def dispatch(model_instance, inputs, cache=None, input_embeddings=None,
+                     skip_logits=False):
+            if not skip_logits:
+                return stock_call(
+                    model_instance,
+                    inputs,
+                    cache=cache,
+                    input_embeddings=input_embeddings,
+                )
+            return model_instance.model(
+                inputs, cache, input_embeddings=input_embeddings
+            )
+
+        model_type.__call__ = dispatch
+        model_type._minimlx_skip_logits_installed = True
+        model_type._minimlx_skip_logits_original = stock_call
+        self._qwen35_skip_logits_class = model_type
+        self._qwen35_skip_logits_original = stock_call
+
+    @staticmethod
+    def _install_gdn_decode_conv_silu(model) -> None:
+        if os.environ.get("MINIMLX_GDN_DECODE_FUSED_CONV_SILU") != "1":
+            return
+        from ..kernels.gdn_conv_silu import install_gdn_decode_conv_silu
+
+        count = install_gdn_decode_conv_silu(model)
+        if count < 1:
+            raise RuntimeError(
+                "GDN conv+SiLU candidate was requested but no compatible Qwen GDN "
+                "layers were found; refusing to benchmark an inactive candidate."
+            )
+
+    def _load_vlm_backend(
+        self, descriptor: ModelDescriptor, plan: ExecutionPlan
+    ) -> "Qwen35Adapter":
+        """Use the shared mlx-vlm lifecycle, then enable Qwen3.5 cache hooks."""
+        super().load(descriptor, plan)
+        self._install_gdn_decode_conv_silu(self.model)
+        from mlx_vlm.vision_cache import VisionFeatureCache
+
+        self._vision_feature_cache = VisionFeatureCache(
+            max_size=max(1, int(os.environ.get("MINIMLX_VISION_FEATURE_CACHE_SIZE", "20")))
+        )
+        self._vlm_enabled = True
+        return self
+
+    def _qwen_cached_image_features(self, prepared, images):
+        """Compute/cache Qwen3.5 vision features before token generation."""
+        if not images or self._vision_feature_cache is None:
+            return None
+        if getattr(getattr(self.model, "config", None), "model_type", None) != "qwen3_5":
+            return None
+        vision_tower = getattr(self.model, "vision_tower", None)
+        if vision_tower is None or prepared.pixel_values is None:
+            return None
+        cached = self._vision_feature_cache.get(images)
+        if cached is not None:
+            self._vision_feature_cache_hits += 1
+            return cached
+        self._vision_feature_cache_misses += 1
+        import mlx.core as mx
+
+        dtype = vision_tower.patch_embed.proj.weight.dtype
+        pixel_values = prepared.pixel_values.astype(dtype)
+        grid_thw = prepared.extra.get("image_grid_thw")
+        features, _ = vision_tower(pixel_values, grid_thw)
+        mx.eval(features)
+        self._vision_feature_cache.put(images, features)
+        self._vision_feature_cache_stores += 1
+        return features
+
+    def _prepare(self, messages, image_parts, video_parts=None, chat_template_kwargs=None):
+        prompt, images, prepared, generation_extra = self._multimodal_context(
+            messages, image_parts, video_parts, chat_template_kwargs
+        )
+        return (
+            prompt,
+            images,
+            prepared.input_ids,
+            prepared.pixel_values,
+            prepared.attention_mask,
+            generation_extra,
+        )
+
+    def _multimodal_generation_extras(self, images, extra):
+        options = dict(extra)
+        options.update(
+            vision_cache=self._vision_feature_cache,
+            # Qwen3.5's mlx-vlm model uses this source key for feature lookup.
+            _image_key=images or None,
+        )
+        return options
+
+    def _multimodal_context(self, prompt, image_parts, video_parts=None, chat_template_kwargs=None):
+        from mlx_vlm.utils import prepare_inputs, should_add_special_tokens
+
+        images = [self._image_input(part) for part in image_parts]
+        videos, video_metadata, cleanup_paths = [], [], []
+        try:
+            for part in video_parts or ():
+                video, metadata, cleanup = _video_input(part)
+                videos.append(video)
+                if metadata is not None:
+                    video_metadata.append(metadata)
+                if cleanup is not None:
+                    cleanup_paths.append(cleanup)
+        except Exception:
+            for path in cleanup_paths:
+                Path(path).unlink(missing_ok=True)
+            raise
+        if video_metadata and len(video_metadata) != len(videos):
+            for path in cleanup_paths:
+                Path(path).unlink(missing_ok=True)
+            raise ValueError("timestamped frame videos cannot be mixed with video-file references in one request")
+        try:
+            prompt = _apply_vlm_chat_template(
+                self.processor,
+                self.model.config,
+                prompt,
+                len(images),
+                video_parts,
+                chat_template_kwargs,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            if images or videos:
+                for path in cleanup_paths:
+                    Path(path).unlink(missing_ok=True)
+                raise RuntimeError(
+                    "the vision checkpoint chat template could not render multimodal content"
+                ) from exc
+            prompt = "\n".join(
+                item.get("text", "")
+                for message in prompt
+                for item in message.get("content", ())
+                if item.get("type") == "text"
+            )
+        except Exception:
+            for path in cleanup_paths:
+                Path(path).unlink(missing_ok=True)
+            raise
+
+        try:
+            if videos:
+                prepared = self._prepare_vlm_inputs(
+                    prompt,
+                    images,
+                    videos=videos,
+                    video_metadata=video_metadata,
+                    prepare_inputs=prepare_inputs,
+                    should_add_special_tokens=should_add_special_tokens,
+                )
+            else:
+                cache_key = self._vision_input_cache_key(prompt, image_parts)
+                prepared = self._vision_input_cache.get(cache_key)
+                if prepared is None:
+                    prepared = self._prepare_vlm_inputs(
+                        prompt,
+                        images,
+                        prepare_inputs=prepare_inputs,
+                        should_add_special_tokens=should_add_special_tokens,
+                    )
+                    self._vision_input_cache.put(cache_key, prepared)
+        finally:
+            for path in cleanup_paths:
+                Path(path).unlink(missing_ok=True)
+
+        cached_image_features = self._qwen_cached_image_features(prepared, images) if not videos else None
+        generation_extra = dict(prepared.extra)
+        if cached_image_features is not None:
+            generation_extra["cached_image_features"] = cached_image_features
+        return prompt, images, prepared, generation_extra
+
+    def vision_cache_stats(self) -> tuple[int, int, int, int]:
+        """Return (hits, misses, stores, bytes) for prepared VLM inputs."""
+        return self._vision_input_cache.stats()
+
+    def vision_feature_cache_metrics(self) -> dict[str, int]:
+        return {
+            "hits": self._vision_feature_cache_hits,
+            "misses": self._vision_feature_cache_misses,
+            "stores": self._vision_feature_cache_stores,
+            "entries": len(getattr(self._vision_feature_cache, "_cache", {}))
+            if self._vision_feature_cache is not None
+            else 0,
+        }
+
+    def _vision_input_cache_key(self, prompt: str, image_parts: list[Any]) -> str:
+        digest = hashlib.sha256()
+        digest.update(str(self.descriptor.model_dir if self.descriptor else "").encode())
+        digest.update(prompt.encode())
+        for part in image_parts:
+            identity = part.data_base64 or part.uri or ""
+            if part.uri and part.uri.startswith("file://"):
+                from urllib.parse import unquote, urlparse
+
+                path = Path(unquote(urlparse(part.uri).path))
+                try:
+                    stat = path.stat()
+                    identity = f"{identity}:{stat.st_size}:{stat.st_mtime_ns}"
+                except OSError:
+                    pass
+            digest.update(identity.encode())
+            digest.update((part.mime_type or "").encode())
+        return digest.hexdigest()
+
+    def _prepare_vlm_inputs(
+        self,
+        prompt: str,
+        images: list[Any],
+        *,
+        prepare_inputs,
+        should_add_special_tokens,
+        videos=None,
+        video_metadata=None,
+    ) -> PreparedVisionInputs:
+        """Run mlx-vlm preprocessing once, before the generation loop.
+
+        This mirrors oMLX's explicit ``prepare_inputs`` boundary. The returned
+        tensors are intentionally kept private to the backend; a future
+        scheduler can replace the final ``generate`` call with cached vision
+        features and a prefill adapter without changing the request protocol.
+        """
+        inputs = prepare_inputs(
+            self.processor,
+            images=images or None,
+            videos=videos or None,
+            video_metadata=video_metadata or None,
+            prompts=prompt,
+            image_token_index=getattr(self.model.config, "image_token_index", None),
+            add_special_tokens=should_add_special_tokens(
+                self.model.config.model_type, self.processor
+            ),
+        )
+        input_ids = inputs.pop("input_ids")
+        pixel_values = inputs.pop("pixel_values", None)
+        attention_mask = inputs.pop("attention_mask", None)
+        return PreparedVisionInputs(
+            prompt=prompt,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            extra=inputs,
+        )
 
     def _load_mtp_backend(
         self, descriptor: ModelDescriptor, draft_path: str
@@ -97,12 +568,11 @@ class Qwen35Adapter:
                     "The opt-in Qwen3.5 MTP backend is source-pinned to "
                     f"mlx-vlm==0.7.2; found {version}."
                 )
-            from mlx_lm.utils import load_tokenizer
             from mlx_vlm.speculative.drafters import (
                 load_drafter,
                 validate_drafter_compatibility,
             )
-            from mlx_vlm.utils import load_model
+            from mlx_vlm.utils import load_model, load_tokenizer
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "MTP mode requires mlx-vlm==0.7.2 in MiniMLX's .venv."
@@ -140,23 +610,50 @@ class Qwen35Adapter:
                 + ", ".join(missing)
             )
 
-        # Qwen3.5's quantized speculative argmax is shape-dependent on this
-        # MLX-VLM build. Batched argmax has been checked against the target's
-        # chunked-prefill greedy decode at 1K, 4K, 8K, and 16K contexts, and is
-        # materially faster than evaluating each position independently.
+        # The optimized quantized-argmax hook is not equivalent to argmax of
+        # the target logits for M>1 on this MLX-VLM build. The device
+        # diagnostic found identical verifier/replay hidden states and logits,
+        # but different tokens from that fused argmax. Keep the semantic
+        # reference (project logits, then argmax) as the default; faster
+        # specialized variants remain opt-in for explicit A/B validation.
         original_argmax = target_lm.speculative_argmax_from_hidden
+        reported_argmax_modes: set[str] = set()
 
         def positionwise_speculative_argmax(hidden):
             import mlx.core as mx
 
-            mode = os.environ.get("MINIMLX_MTP_VERIFY_ARGMAX", "batched")
-            if mode not in ("positionwise", "batched", "singleton_batch"):
+            mode = os.environ.get("MINIMLX_MTP_VERIFY_ARGMAX", "logits")
+            if mode not in ("logits", "positionwise", "batched", "singleton_batch"):
                 raise RuntimeError(
-                    "MINIMLX_MTP_VERIFY_ARGMAX must be 'positionwise', "
+                    "MINIMLX_MTP_VERIFY_ARGMAX must be 'logits', 'positionwise', "
                     "'batched', or 'singleton_batch'"
                 )
+            if mode not in reported_argmax_modes:
+                print(f"[mtp] verifier_argmax_hook=active mode={mode}")
+                reported_argmax_modes.add(mode)
             if mode == "batched":
                 return original_argmax(hidden)
+            if mode == "logits":
+                if hidden.ndim < 3 or hidden.shape[1] <= 1:
+                    logits = target_lm.speculative_logits_from_hidden(hidden)
+                    return mx.argmax(logits, axis=-1)
+                # MLX-VLM's affine quantized head changes kernel strategy with
+                # the token dimension. The M=4 projection can select a
+                # different token from the identical M=1 row (observed at
+                # verifier position 0), so project each verifier row with
+                # singleton shape before argmax.
+                return mx.concatenate(
+                    [
+                        mx.argmax(
+                            target_lm.speculative_logits_from_hidden(
+                                hidden[:, position : position + 1, :]
+                            ),
+                            axis=-1,
+                        )
+                        for position in range(hidden.shape[1])
+                    ],
+                    axis=1,
+                )
             if mode == "singleton_batch" and hidden.ndim >= 3 and hidden.shape[1] > 1:
                 if target_lm.args.tie_word_embeddings:
                     from mlx_vlm.models.exact_speculative_verify import (
@@ -187,6 +684,8 @@ class Qwen35Adapter:
             )
 
         target_lm.speculative_argmax_from_hidden = positionwise_speculative_argmax
+        if target_lm.speculative_argmax_from_hidden is not positionwise_speculative_argmax:
+            raise RuntimeError("Failed to install the Qwen3.5 MTP verifier argmax hook")
 
         original_verify_hidden = target_lm.speculative_verify_hidden
 
@@ -215,32 +714,45 @@ class Qwen35Adapter:
         target_lm.speculative_verify_hidden = selectable_verify_hidden
 
         self.model = target
-        self.tokenizer = load_tokenizer(descriptor.model_dir)
+        # mlx-vlm's tokenizer loader uses pathlib operations on model_path.
+        # ModelDescriptor stores paths as strings, so normalize at this API
+        # boundary just as the VLM model loader does above.
+        self.tokenizer = load_tokenizer(Path(descriptor.model_dir))
         self.descriptor = descriptor
         self._mtp_draft_model = drafter
         self._mtp_enabled = True
-        # The ordinary mlx-lm load path installs these on its model, but MTP
-        # uses mlx-vlm's Qwen3.5 VLM target. Install the same opt-in native Q4
-        # projection and direct gate/up/down routes on that target; the
-        # installers retain their normal env gate and sequence threshold.
-        from ..kernels.q4_native import (
-            install_q4_native_mlp,
-            install_q4_native_prefill,
-        )
+        self._mtp_target_language_model = target_lm
+        self._mtp_argmax_hook = positionwise_speculative_argmax
+        # Keep the first MTP path on one coherent MLX-VLM runtime.  The
+        # MiniMLX native Q4/FA256 extensions are safe on the ordinary mlx-lm
+        # route, but loading them into the MLX-VLM target can register a second
+        # nanobind MLX device domain and abort the Python process.  Re-enable
+        # them only for an explicit MTP compatibility experiment after the
+        # stock correctness path is validated.
+        if os.environ.get("MINIMLX_MTP_ENABLE_MINIMLX_KERNELS") == "1":
+            from ..kernels.q4_native import (
+                install_q4_native_mlp,
+                install_q4_native_prefill,
+            )
+            from ..kernels.mtp_verify import install_mtp_verify_fused_attention
+            from ..kernels.mtp_gdn_prework import install_mtp_gdn_prework
+            from ..kernels.mtp_cache_commit import install_mtp_full_accept_cache_fastpath
+            from ..kernels.gdn import install_mtp_vlm_gdn_prefill
+            from ..kernels.fa256 import install_native_fa256_prefill
 
-        install_q4_native_prefill(self.model, min_tokens=1024)
-        install_q4_native_mlp(self.model, min_tokens=1024)
-        from ..kernels.mtp_verify import install_mtp_verify_fused_attention
-        from ..kernels.mtp_gdn_prework import install_mtp_gdn_prework
-        from ..kernels.mtp_cache_commit import install_mtp_full_accept_cache_fastpath
-        from ..kernels.gdn import install_mtp_vlm_gdn_prefill
-        from ..kernels.fa256 import install_native_fa256_prefill
-
-        install_mtp_vlm_gdn_prefill()
-        install_native_fa256_prefill()
-        install_mtp_verify_fused_attention()
-        install_mtp_gdn_prework()
-        install_mtp_full_accept_cache_fastpath()
+            install_q4_native_prefill(self.model, min_tokens=1024)
+            install_q4_native_mlp(self.model, min_tokens=1024)
+            install_mtp_vlm_gdn_prefill()
+            install_native_fa256_prefill()
+            install_mtp_verify_fused_attention()
+            install_mtp_gdn_prework()
+            install_mtp_full_accept_cache_fastpath()
+        else:
+            print(
+                "[mtp] MiniMLX native Q4/FA256 kernels disabled; "
+                "using coherent MLX-VLM target path",
+                flush=True,
+            )
         return self
 
     def _generate_mtp_greedy(
@@ -252,11 +764,11 @@ class Qwen35Adapter:
         """Greedy MTP using MLX-VLM's matching Qwen3.5 target transactions."""
         import mlx.core as mx
 
-        from mlx_lm.generate import generation_stream
         from mlx_vlm.speculative.mtp import (
             _buffer_mtp_target_cache,
             _mtp_rounds,
         )
+        generation_stream = mx.new_thread_local_stream(mx.default_device())
 
         if max_tokens <= 0:
             return prompt_tokens, [], "", 0.0, 0.0
@@ -264,6 +776,15 @@ class Qwen35Adapter:
             raise ValueError("MTP greedy path requires a non-empty prompt")
 
         lm = self.model.language_model
+        if lm is not self._mtp_target_language_model:
+            raise RuntimeError(
+                "Loaded Qwen3.5 language model instance changed after installing "
+                "the MTP verifier hook"
+            )
+        if lm.speculative_argmax_from_hidden is not self._mtp_argmax_hook:
+            raise RuntimeError(
+                "MTP verifier argmax hook was replaced after model load"
+            )
         cache = lm.make_cache()
         prompt = mx.array(prompt_tokens, dtype=mx.uint32)
         from ..kernels.mtp_prompt_prefill import MTPPromptPrimer
@@ -328,8 +849,24 @@ class Qwen35Adapter:
                 )
                 if round_matches or token_matches:
                     relative = token_relative if token_matches else 0
+                    verify_slice = verify_hidden[:, relative : relative + 1, :]
                     verifier_all_tokens = lm.speculative_argmax_from_hidden(verify_hidden)
                     verifier_token = verifier_all_tokens.reshape(-1)[relative]
+                    # Preserve the same verifier hidden row and compare its
+                    # ordinary LM-head projection with the specialized
+                    # speculative projection. This distinguishes a forward/
+                    # cache discrepancy from a quantized readout discrepancy.
+                    speculative_logits = lm.speculative_logits_from_hidden(verify_slice)
+                    speculative_logits_token = mx.argmax(
+                        speculative_logits, axis=-1
+                    )
+                    ordinary_head = (
+                        lm.model.embed_tokens.as_linear
+                        if lm.args.tie_word_embeddings
+                        else lm.lm_head
+                    )
+                    ordinary_logits = ordinary_head(verify_slice)
+                    ordinary_logits_token = mx.argmax(ordinary_logits, axis=-1)
 
                     saved_position_ids = getattr(lm, "_position_ids", None)
                     saved_rope_deltas = getattr(lm, "_rope_deltas", None)
@@ -356,11 +893,36 @@ class Qwen35Adapter:
                         replay_output = lm(
                             mx.array([[token]], dtype=mx.uint32),
                             cache=replay_cache,
+                            return_hidden=True,
                         )
                     if replay_output is None:
                         raise RuntimeError("MTP diagnostic replay prefix is empty")
-                    replay_token = mx.argmax(replay_output.logits[:, -1, :], axis=-1)
-                    mx.eval(verifier_token, replay_token)
+                    replay_hidden = replay_output.hidden_states[-1][:, -1:, :]
+                    replay_logits = replay_output.logits[:, -1:, :]
+                    replay_token = mx.argmax(replay_logits, axis=-1)
+                    mx.eval(
+                        verifier_token,
+                        speculative_logits_token,
+                        ordinary_logits_token,
+                        replay_token,
+                        verify_slice,
+                        replay_hidden,
+                        speculative_logits,
+                        ordinary_logits,
+                        replay_logits,
+                    )
+                    hidden_max_abs = mx.max(mx.abs(verify_slice - replay_hidden))
+                    speculative_vs_ordinary_max_abs = mx.max(
+                        mx.abs(speculative_logits - ordinary_logits)
+                    )
+                    ordinary_vs_replay_max_abs = mx.max(
+                        mx.abs(ordinary_logits - replay_logits)
+                    )
+                    mx.eval(
+                        hidden_max_abs,
+                        speculative_vs_ordinary_max_abs,
+                        ordinary_vs_replay_max_abs,
+                    )
                     print(
                         "[mtp-diagnostic] "
                         f"round={len(accept_lens)} "
@@ -369,15 +931,20 @@ class Qwen35Adapter:
                         f"verify_relative={relative} "
                         f"verify_input={verify_input[0].tolist()} "
                         f"verifier_next={int(verifier_token.reshape(-1).item())} "
-                        f"replay_prefix_extra={same_round_prefix} "
-                        f"replay_next={int(replay_token.reshape(-1).item())}"
+                        f"speculative_logits_next={int(speculative_logits_token.reshape(-1).item())} "
+                        f"ordinary_head_next={int(ordinary_logits_token.reshape(-1).item())} "
+                        f"replay_next={int(replay_token.reshape(-1).item())} "
+                        f"hidden_max_abs={float(hidden_max_abs.item()):.8g} "
+                        f"speculative_vs_ordinary_logits_max_abs={float(speculative_vs_ordinary_max_abs.item()):.8g} "
+                        f"ordinary_vs_replay_logits_max_abs={float(ordinary_vs_replay_max_abs.item()):.8g} "
+                        f"replay_prefix_extra={same_round_prefix}"
                     )
                     lm._position_ids = saved_position_ids
                     lm._rope_deltas = saved_rope_deltas
                 return result
 
             lm.speculative_verify_hidden = verify_hidden_with_diagnostic
-        eos_ids = set(getattr(self.tokenizer, "eos_token_ids", ()) or ())
+        eos_ids = _token_ids_as_set(getattr(self.tokenizer, "eos_token_ids", ()))
         mtp_profile = os.environ.get("MINIMLX_MTP_PROFILE_ROUNDS") == "1"
         profile_samples: dict[str, list[float]] = {}
         layer_profile_samples: dict[str, list[float]] = {}
@@ -532,6 +1099,23 @@ class Qwen35Adapter:
                             round_trace[round_index]["tokens"].append(token)
                         if token in eos_ids or len(generated) >= max_tokens:
                             break
+            except BaseException:
+                _cleanup_failed_mtp_request(
+                    mx,
+                    generation_stream,
+                    original_reset,
+                    self.model,
+                    cache,
+                    shared_kv,
+                )
+                # A propagated traceback retains this frame. Drop its large
+                # lazy-graph roots explicitly rather than pinning failed KV
+                # state until the caller releases the exception.
+                hidden = None
+                output = None
+                primer = None
+                self._mtp_last_round_trace.clear()
+                raise
             finally:
                 if had_reset_override:
                     drafter.reset = previous_reset_override
@@ -742,6 +1326,8 @@ class Qwen35Adapter:
 
     def clear_session(self, session_id: str) -> None:
         self._session_prefix_caches.pop(session_id, None)
+        self._vlm_prompt_cache_states.pop(session_id, None)
+
 
     def _generate_greedy_fast(
         self,
@@ -761,9 +1347,23 @@ class Qwen35Adapter:
 
         if not prompt_tokens:
             raise ValueError("greedy fast path requires a non-empty prompt")
+        kv_bits = os.environ.get("MINIMLX_KV_CACHE_BITS")
+        # The hand-written fast path owns a plain cache.  Use mlx-lm's
+        # generator when KV quantization is explicitly requested so its
+        # quantized cache transition is applied at the right token boundary.
+        if kv_bits not in (None, "", "0"):
+            raise AssertionError(
+                "_generate_greedy_fast must not be selected with KV quantization"
+            )
         cache = self.model.make_cache()
         prompt = mx.array(prompt_tokens, dtype=mx.uint32)
+        model_call = self.model
+        if hasattr(self.model, "language_model"):
+            model_call = self.model.language_model
         processed = 0
+        skip_intermediate_logits = (
+            os.environ.get("MINIMLX_PREFILL_SKIP_LOGITS", "1") == "1"
+        )
         prefill_start = time.perf_counter()
         # Keep prefill, cache-state evaluation, chunk synchronization, and the
         # first-token computation on the same stream.  mlx_lm.generate_step
@@ -774,14 +1374,32 @@ class Qwen35Adapter:
             while len(prompt_tokens) - processed > 1:
                 remaining = len(prompt_tokens) - processed - 1
                 count = min(prefill_step_size, remaining)
-                self.model(
-                    prompt[processed : processed + count][None], cache=cache
-                )
+                prefill_kwargs = {"cache": cache}
+                if skip_intermediate_logits:
+                    # No intermediate prefill logits are consumed by greedy
+                    # generation. Some mlx-lm model versions expose this
+                    # switch, while older versions reject the keyword.
+                    prefill_kwargs["skip_logits"] = True
+                try:
+                    model_call(
+                        prompt[processed : processed + count][None], **prefill_kwargs
+                    )
+                except TypeError as exc:
+                    if not skip_intermediate_logits or "skip_logits" not in str(exc):
+                        raise
+                    # Retry the same untouched chunk through the stock model
+                    # contract and keep the capability disabled for the rest
+                    # of this request. This is a compatibility fallback, not
+                    # a benchmark failure.
+                    skip_intermediate_logits = False
+                    model_call(
+                        prompt[processed : processed + count][None], cache=cache
+                    )
                 mx.eval([c.state for c in cache])
                 self._clear_prefill_allocator_cache(mx, generation_stream)
                 processed += count
 
-            logits = self.model(prompt[processed:][None], cache=cache)[:, -1, :]
+            logits = model_call(prompt[processed:][None], cache=cache)[:, -1, :]
             sampled = mx.argmax(logits, axis=-1)
             # TTFT ends when the first token is available to the caller, not
             # when its evaluation has merely been submitted.
@@ -833,24 +1451,106 @@ class Qwen35Adapter:
         context_tokens: int | None = None,
         prefill_step_size: int = 2048,
         session_id: str | None = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        max_context_tokens: int | None = None,
     ):
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("model is not loaded")
         from mlx_lm import stream_generate
 
+        # The context benchmark needs to be able to distinguish a real
+        # end-of-turn from a decode/prefill error.  mlx-lm implements EOS
+        # stopping inside stream_generate by reading tokenizer.eos_token_ids,
+        # so make the policy explicit instead of silently changing it in a
+        # benchmark wrapper.
+        ignore_eos = os.environ.get("MINIMLX_IGNORE_EOS") == "1"
+
         encode = getattr(self.tokenizer, "encode", None)
+        if max_context_tokens is not None:
+            if max_context_tokens <= 0:
+                raise ValueError("max_context_tokens must be positive")
+            prompt_tokens = encode(prompt, add_special_tokens=False) if encode else []
+            if len(prompt_tokens) > max_context_tokens:
+                prompt_tokens = prompt_tokens[-max_context_tokens:]
+            generation_prompt = prompt_tokens
+        else:
+            prompt_tokens = None
+            generation_prompt = prompt
         if context_tokens is not None:
             prompt_tokens = self._encode_prefix(encode, prompt, context_tokens)
             generation_prompt = prompt_tokens
-        else:
+        elif prompt_tokens is None:
             prompt_tokens = encode(prompt, add_special_tokens=False) if encode else []
-            generation_prompt = prompt
 
         effective_prefill_step_size = choose_prefill_step_size(
             len(prompt_tokens), prefill_step_size
         )
 
-        if self._mtp_enabled:
+        if self._dflash_enabled:
+            if min_p != 0.0 or repetition_penalty != 1.0 or presence_penalty != 0.0 or frequency_penalty != 0.0:
+                raise ValueError(
+                    "DFlash currently supports temperature, top-p, and top-k sampling; "
+                    "disable min-p and repetition/presence/frequency penalties."
+                )
+            from dflash.model_mlx import stream_generate as dflash_stream_generate
+            configured_block_size = int(
+                getattr(getattr(self._dflash_draft_model, "config", None), "block_size", 5)
+            )
+            block_size = min(
+                configured_block_size,
+                int(os.environ.get("MINIMLX_DFLASH_BLOCK_SIZE", "5")),
+            )
+            if block_size < 2:
+                raise ValueError("MINIMLX_DFLASH_BLOCK_SIZE must be at least 2")
+
+            original_eos_ids = None
+            if os.environ.get("MINIMLX_IGNORE_EOS") == "1":
+                original_eos_ids = getattr(self.tokenizer, "eos_token_ids", None)
+                self.tokenizer.eos_token_ids = set()
+            try:
+                responses = dflash_stream_generate(
+                    self.model,
+                    self._dflash_draft_model,
+                    self.tokenizer,
+                    generation_prompt,
+                    block_size=block_size,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    prefill_step_size=effective_prefill_step_size,
+                )
+                text_parts: list[str] = []
+                output_tokens: list[int] = []
+                prefill_ms = 0.0
+                decode_tps = 0.0
+                for response in responses:
+                    text_parts.append(response.text)
+                    output_tokens.extend(int(token) for token in response.tokens)
+                    if response.prompt_tokens and response.prompt_tps > 0:
+                        prefill_ms = response.prompt_tokens * 1000.0 / response.prompt_tps
+                    decode_tps = response.generation_tps
+            finally:
+                if original_eos_ids is not None:
+                    self.tokenizer.eos_token_ids = original_eos_ids
+            text = "".join(text_parts)
+            decode_ms = len(output_tokens) * 1000.0 / decode_tps if decode_tps else 0.0
+            return prompt_tokens, output_tokens, text, prefill_ms, decode_ms
+
+        greedy = (
+            temperature == 0.0
+            and min_p == 0.0
+            and repetition_penalty == 1.0
+            and presence_penalty == 0.0
+            and frequency_penalty == 0.0
+        )
+        if self._mtp_enabled and greedy:
             return self._generate_mtp_greedy(
                 prompt_tokens,
                 max_tokens,
@@ -859,6 +1559,8 @@ class Qwen35Adapter:
 
         prefix_cache = self._prefix_cache
         if session_id is not None and self._prefix_cache is not None:
+            from ..prompt_cache import PrefixCache
+
             prefix_cache = self._session_prefix_caches.setdefault(
                 session_id,
                 PrefixCache(
@@ -908,6 +1610,8 @@ class Qwen35Adapter:
             and prompt_cache is None
             and session_id is None
             and max_tokens > 0
+            and greedy
+            and os.environ.get("MINIMLX_KV_CACHE_BITS") in (None, "", "0")
         ):
             return self._generate_greedy_fast(
                 prompt_tokens,
@@ -920,10 +1624,49 @@ class Qwen35Adapter:
             "max_tokens": max_tokens,
             "prefill_step_size": effective_prefill_step_size,
         }
+        kv_bits = os.environ.get("MINIMLX_KV_CACHE_BITS")
+        if kv_bits not in (None, "", "0"):
+            bits = int(kv_bits)
+            if bits not in (4, 8):
+                raise ValueError("MINIMLX_KV_CACHE_BITS must be 4, 8, or 0")
+            stream_kwargs.update(
+                kv_bits=bits,
+                kv_group_size=int(os.environ.get("MINIMLX_KV_CACHE_GROUP_SIZE", "64")),
+                quantized_kv_start=int(
+                    os.environ.get("MINIMLX_QUANTIZED_KV_START", "512")
+                ),
+            )
+        if not greedy:
+            from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+            stream_kwargs["sampler"] = make_sampler(
+                temp=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+            )
+            processors = make_logits_processors(
+                repetition_penalty=(
+                    repetition_penalty if repetition_penalty != 1.0 else None
+                ),
+                presence_penalty=presence_penalty if presence_penalty != 0.0 else None,
+                frequency_penalty=frequency_penalty if frequency_penalty != 0.0 else None,
+            )
+            if processors:
+                stream_kwargs["logits_processors"] = processors
         if prompt_cache is not None:
             stream_kwargs["prompt_cache"] = prompt_cache
             stream_kwargs["prompt_progress_callback"] = on_prompt_progress
-        responses = stream_generate(self.model, self.tokenizer, **stream_kwargs)
+        original_eos_ids = None
+        if ignore_eos:
+            original_eos_ids = getattr(self.tokenizer, "eos_token_ids", None)
+            self.tokenizer.eos_token_ids = set()
+        try:
+            responses = stream_generate(self.model, self.tokenizer, **stream_kwargs)
+        except BaseException:
+            if original_eos_ids is not None:
+                self.tokenizer.eos_token_ids = original_eos_ids
+            raise
         text_parts: list[str] = []
         output_tokens: list[int] = []
         prefill_ms = 0.0
@@ -948,6 +1691,8 @@ class Qwen35Adapter:
                 prefill_ms = prompt_count * 1000.0 / response.prompt_tps
                 decode_tps = response.generation_tps
         finally:
+            if original_eos_ids is not None:
+                self.tokenizer.eos_token_ids = original_eos_ids
             if original_clear_cache is not None:
                 mx.clear_cache = original_clear_cache
         output = "".join(text_parts)
@@ -1438,6 +2183,13 @@ class Qwen35Adapter:
         """
         if target_tokens <= 0:
             raise ValueError("context_tokens must be positive")
+        # Keep the oMLX-aligned benchmark byte/token exact.  Its largest
+        # prompt is only 16K tokens, so encoding the complete decoded prompt
+        # avoids introducing artificial BPE boundaries at character chunks.
+        if len(text) <= 256 * 1024:
+            result = list(encode(text, add_special_tokens=False))
+            if len(result) >= target_tokens:
+                return result[:target_tokens]
         result: list[int] = []
         # Large enough to preserve normal BPE merges across the useful prefix,
         # while still far below the model tokenizer's maximum length.

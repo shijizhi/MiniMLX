@@ -1,6 +1,11 @@
 # Qwen3.5 MTP compatibility research
 
-## Current MiniMLX boundary
+## Historical boundary and current status
+
+The initial investigation found the gaps listed below. The isolated MTP backend
+has since been implemented and passed the correctness gates documented near the
+end of this file; the remaining limitations are opt-in status and broader
+benchmark coverage, not missing proposal/verification/rollback functionality.
 
 - `Qwen35Adapter.generate()` uses a greedy single-token decode loop. It has no MTP proposal, target verification, accepted-token accounting, or speculative cache rollback path.
 - The local `Qwen3.5-0.8B-MLX-4bit/config.json` declares `text_config.mtp_num_hidden_layers = 1` and `mtp_use_dedicated_embeddings = false`.

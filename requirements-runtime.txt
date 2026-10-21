@@ -3,3 +3,4 @@ mlx
 mlx-lm
 tokenizers
 safetensors
+dflash==0.1.0

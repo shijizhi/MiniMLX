@@ -6,9 +6,12 @@
 
 use std::path::PathBuf;
 
-use minimlx_protocol::{ProfileGroup, Request, ResponsePayload};
+use minimlx_protocol::{
+    ContentPart, InferenceMessage, ModelTask, ProfileGroup, Request, ResponsePayload,
+};
 use minimlx_supervisor::PythonWorker;
 use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -101,12 +104,24 @@ fn request_once(
     prefill_step_size: u32,
 ) -> minimlx_protocol::ResponsePayload {
     worker
-        .request(&Request::Generate {
-            prompt: prompt.to_string(),
-            max_tokens,
-            context_tokens,
+        .request(&Request::Infer {
+            schema_version: 1,
+            task: ModelTask::Generation,
+            messages: vec![InferenceMessage {
+                role: "user".to_string(),
+                content: vec![ContentPart::Text {
+                    text: prompt.to_string(),
+                    metadata: json!({}),
+                }],
+            }],
+            accelerations: vec![],
+            options: json!({
+                "max_tokens": max_tokens,
+                "context_tokens": context_tokens,
+                "prefill_step_size": prefill_step_size,
+            }),
+            stream: false,
             session_id: session_id.map(str::to_owned),
-            prefill_step_size,
         })
         .expect("Python worker request failed")
         .payload
@@ -126,6 +141,29 @@ fn load_config(root: &std::path::Path) -> AppConfig {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let launch_gui = args.len() == 1 || args.iter().any(|arg| arg == "--gui");
+    if launch_gui {
+        let root = std::env::current_dir().expect("current directory");
+        let config = load_config(&root);
+        #[cfg(target_os = "macos")]
+        let python = config
+            .python
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join(".venv/bin/python"));
+        minimlx_gpui::run_app(config.model_dir, root, python);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = config;
+            eprintln!("The MiniMLX desktop UI currently requires macOS.");
+        }
+        return;
+    }
+
+    run_cli();
+}
+
+fn run_cli() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         usage();
@@ -170,15 +208,27 @@ fn main() {
             ("MINIMLX_DISABLE_Q4_PREFILL_DENSE", "1"),
             (
                 "MINIMLX_DISABLE_Q4_MLP_FUSION",
-                if config.disable_q4_mlp_fusion { "1" } else { "0" },
+                if config.disable_q4_mlp_fusion {
+                    "1"
+                } else {
+                    "0"
+                },
             ),
             (
                 "MINIMLX_ENABLE_Q4_NATIVE_PREFILL",
-                if config.enable_q4_native_prefill { "1" } else { "0" },
+                if config.enable_q4_native_prefill {
+                    "1"
+                } else {
+                    "0"
+                },
             ),
             (
                 "MINIMLX_ENABLE_NATIVE_FA256_PREFILL",
-                if config.enable_native_fa256_prefill { "1" } else { "0" },
+                if config.enable_native_fa256_prefill {
+                    "1"
+                } else {
+                    "0"
+                },
             ),
             (
                 "MINIMLX_GREEDY_SKIP_LOGSUMEXP",
@@ -222,15 +272,27 @@ fn main() {
             ("MINIMLX_DISABLE_Q4_PREFILL_DENSE", "0"),
             (
                 "MINIMLX_DISABLE_Q4_MLP_FUSION",
-                if config.disable_q4_mlp_fusion { "1" } else { "0" },
+                if config.disable_q4_mlp_fusion {
+                    "1"
+                } else {
+                    "0"
+                },
             ),
             (
                 "MINIMLX_ENABLE_Q4_NATIVE_PREFILL",
-                if config.enable_q4_native_prefill { "1" } else { "0" },
+                if config.enable_q4_native_prefill {
+                    "1"
+                } else {
+                    "0"
+                },
             ),
             (
                 "MINIMLX_ENABLE_NATIVE_FA256_PREFILL",
-                if config.enable_native_fa256_prefill { "1" } else { "0" },
+                if config.enable_native_fa256_prefill {
+                    "1"
+                } else {
+                    "0"
+                },
             ),
             (
                 "MINIMLX_GREEDY_SKIP_LOGSUMEXP",
@@ -282,15 +344,24 @@ fn main() {
             session_id.as_deref(),
             prefill_step_size,
         ) {
-            ResponsePayload::Generate {
-                text,
-                decode_tokens_per_second,
+            ResponsePayload::Inference {
+                payload_type,
+                payload,
+                metrics,
                 ..
-            } => {
+            } if payload_type == "GenerationPayload" => {
+                let text = payload["text"].as_str().expect("generation text missing");
+                let decode_ms = metrics["decode_ms"].as_f64().unwrap_or(0.0);
+                let generated = payload["generated_tokens"].as_array().map_or(0, Vec::len);
+                let decode_tps = if decode_ms > 0.0 {
+                    generated as f64 * 1000.0 / decode_ms
+                } else {
+                    0.0
+                };
                 println!("{text}");
-                println!("decode={decode_tokens_per_second:.2} tok/s");
+                println!("decode={decode_tps:.2} tok/s");
             }
-            ResponsePayload::Error { error } => eprintln!("worker error: {error}"),
+            ResponsePayload::Error { error, .. } => eprintln!("worker error: {error}"),
             other => println!("worker response: {other:?}"),
         },
         "benchmark" => {
@@ -325,13 +396,20 @@ fn main() {
                     session_id.as_deref(),
                     prefill_step_size,
                 ) {
-                    ResponsePayload::Generate {
-                        prefill_ms: prefill,
-                        decode_ms: decode,
-                        prompt_tokens,
-                        generated_tokens,
+                    ResponsePayload::Inference {
+                        payload_type,
+                        payload,
+                        metrics,
                         ..
-                    } => {
+                    } if payload_type == "GenerationPayload" => {
+                        let prefill = metrics["prefill_ms"].as_f64().unwrap_or(0.0);
+                        let decode = metrics["decode_ms"].as_f64().unwrap_or(0.0);
+                        let prompt_tokens = payload["prompt_tokens"]
+                            .as_array()
+                            .expect("generation prompt_tokens missing");
+                        let generated_tokens = payload["generated_tokens"]
+                            .as_array()
+                            .expect("generation generated_tokens missing");
                         prefill_ms.push(prefill);
                         decode_ms.push(decode);
                         if generated_tokens.len() != max_tokens as usize {
@@ -351,7 +429,7 @@ fn main() {
                             );
                         }
                     }
-                    ResponsePayload::Error { error } => panic!("worker error: {error}"),
+                    ResponsePayload::Error { error, .. } => panic!("worker error: {error}"),
                     other => panic!("unexpected worker response: {other:?}"),
                 }
             }
@@ -449,7 +527,7 @@ fn main() {
                         );
                     }
                 }
-                ResponsePayload::Error { error } => eprintln!("worker error: {error}"),
+                ResponsePayload::Error { error, .. } => eprintln!("worker error: {error}"),
                 other => println!("worker response: {other:?}"),
             }
         }
@@ -495,7 +573,7 @@ fn main() {
                         println!("max_abs_error={error:.6e}");
                     }
                 }
-                ResponsePayload::Error { error } => eprintln!("worker error: {error}"),
+                ResponsePayload::Error { error, .. } => eprintln!("worker error: {error}"),
                 other => println!("worker response: {other:?}"),
             }
         }

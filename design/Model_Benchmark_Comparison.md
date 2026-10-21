@@ -5,9 +5,9 @@ MiniMLX 和 oMLX 的原始指标，不用单一吞吐量替代 TTFT、TPOT 和�
 
 ## 固定测试协议
 
-- 硬件：MacBook Air M4，24 GB 统一内存。
+- 硬件按每次运行单独记录；历史数据未记录的，不从主机名或其他运行推断。
 - 请求：单请求、代码上下文、生成 128 tokens。
-- Warm-up：32；正式重复：5；统计：median。
+- Warm-up：32；正式重复：5；统计：median，并保留全部原始样本。
 - MiniMLX：prefill step size = 1024。
 - 指标：TTFT、TPOT、PP TPS、TG TPS、E2E、峰值内存。
 - 标准上下文：1K、4K、8K、16K；32K 仅在内存安全时测试。
@@ -31,6 +31,8 @@ MiniMLX 和 oMLX 的原始指标，不用单一吞吐量替代 TTFT、TPOT 和�
 | Qwen3.5-0.8B | Q4 | PASS | 已测 | 已测 | 已测 | 已测 | MiniMLX decode 优势，prefill 接近 |
 | Qwen3.5-0.8B | BF16 | PASS | 已测 | 已测 | 已测 | 已测 | MiniMLX TTFT/TPOT/TG TPS 均领先 |
 | Qwen3.5-4B | BF16 | PASS | 已测 | 已测 | 已测 | 已测 | 当前数据 MiniMLX TTFT/TPOT/E2E 更快；需留意 oMLX 批处理设置 |
+| Qwen3.5-9B | MLX affine Q4, group 64 | PASS | 已测 | 已测 | 已测 | 已测 | MiniMLX-only 三次中位数；1K/16K 提前 EOS，硬件信息待确认 |
+| Qwen3.5-27B | MLX affine Q4, group 64 | PASS | 已测 | 已测 | 已测 | 已测 | 已记录 MiniMLX 五次中位数与用户提供的 oMLX 截图；对照条件未完全对齐 |
 
 ## Qwen3.5-0.8B-MLX-4bit
 
@@ -280,6 +282,67 @@ MiniMLX 本轮没有 PP TPS 或各 context 的峰值内存数据，不能比较�
 
 MiniMLX 完成单次 1K/4K/8K/16K 测量，表面上全项优于截图所列 oMLX 单请求指标；
 但批次设置未完全对齐，且双方都不是多次中位数。结论仅作初步参考，不触发新性能专项。
+
+## Qwen3.5-9B-4bit (MiniMLX-only)
+
+- 下载来源：`mlx-community/Qwen3.5-9B-4bit`
+- 格式：MLX affine Q4，group size 64
+- 架构：`Qwen3_5ForConditionalGeneration`，32 layers（24 linear-attention、8 full-attention）
+- 参数量：descriptor 未提供；不从 repo 名称推断
+- 兼容性：文本生成 PASS；单图 OCR PASS（输出 `Swift / Transformers`）
+- 基准：MiniMLX `benchmark_context_matrix.py`；warm-up 32、max tokens 128、step 2048、每 context 3 次；仅自有 MiniMLX 结果，本条没有运行 oMLX 对照测试。
+- 整体峰值内存：7.680 GiB。运行机器未由本次日志独立确认。
+- 注意：1K 实际生成 29 tokens，16K 实际生成 16 tokens；这两行的 TG TPS/E2E 受提前停止影响，保留实测数字但不视为满 128-token 基准。
+
+| Context | TTFT median (ms) | TPOT median (ms) | PP TPS median | TG TPS median | Generated | E2E median (ms) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 620.7 | 18.14 | 1,649.8 | 57.11 | 29/128 | 1,429.6 |
+| 4K | 2,387.1 | 18.55 | 1,715.9 | 54.34 | 128/128 | 5,035.6 |
+| 8K | 4,835.0 | 19.12 | 1,694.3 | 52.72 | 128/128 | 7,584.4 |
+| 16K | 10,321.5 | 20.34 | 1,587.4 | 52.43 | 16/128 | 10,944.0 |
+
+每个上下文的三次原始样本、运行命令和协议记录在
+[`Qwen35_Family_Coverage.md`](/Users/jizhishi/mycode/ai/minimlx/design/Qwen35_Family_Coverage.md)。
+
+## Qwen3.5-27B-4bit (MiniMLX result + user-supplied oMLX reference)
+
+- 下载来源：`mlx-community/Qwen3.5-27B-4bit`
+- 缓存记录 revision：`45797d2985a12c55e6473686e9ea91b95e959553`
+- 格式/架构：MLX affine Q4，group size 64；`Qwen3_5ForConditionalGeneration`，Dense，64 layers；3 个权重分片均在 index 中且文件齐全。
+- 环境：Apple M5 Pro，64 GiB unified memory；Python 3.13.12、MLX 0.32.2、mlx-lm 0.31.3、mlx-vlm 0.7.2；MiniMLX revision `dbad46b`，工作区包含其他未提交修改。
+- Text smoke：PASS，4/4 tokens；smoke peak 16.830 GiB。
+- Vision smoke：PASS；`Benchmarks/fixtures/swift-t-banner.png` 两次均输出 `Swift / Transformers`，每次 4,155 prompt tokens / 5 completion tokens。视觉缓存由 miss/store (1) 变为 hit (1)，保持 1 条 entry。
+- 基准：MiniMLX `benchmark_context_matrix.py`；warm-up 32、max tokens 128、step 1024、每 context 5 次；MiniMLX 数值为自有测试，没有运行 oMLX 基准。Suite peak memory 18.465 GiB。
+- 1K 自然提前 EOS，生成 111/128；4K/8K/16K 均生成 128/128。1K 的 TG TPS/E2E 保留为观测，不当成满长 decode 比较。
+
+| Context | TTFT median (ms) | TPOT median (ms) | PP TPS median | TG TPS median | Generated | E2E median (ms) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 2,182.0 | 57.23 | 469.3 | 17.63 | 111/128 | 8,813.1 |
+| 4K | 9,161.0 | 58.31 | 447.1 | 17.28 | 128/128 | 16,875.4 |
+| 8K | 22,013.1 | 69.24 | 372.1 | 14.56 | 128/128 | 31,245.3 |
+| 16K | 42,153.1 | 63.91 | 388.7 | 15.77 | 128/128 | 50,584.8 |
+
+五次原始样本（每项顺序 TTFT ms / TPOT ms / PP TPS / TG TPS / E2E ms）和精确运行命令见
+[`Qwen35_Family_Coverage.md`](/Users/jizhishi/mycode/ai/minimlx/design/Qwen35_Family_Coverage.md)。
+
+### 用户提供的 oMLX 对照截图
+
+以下 oMLX 数值由用户提供的 GUI 截图转录（页面标记“单请求结果”“试验：4”）。这不是 MiniMLX 运行得到的 oMLX 基准；截图没有完整说明重复统计、warm-up、prefill step 和硬件/版本，因此作为参考，不视为严格同条件结论。MiniMLX 五次中位数见本节前表；峰值内存是 MiniMLX 全 suite peak，非逐上下文值。
+
+为贴近截图中的单请求形式，以下主对照采用 MiniMLX 随后追加的一次单次矩阵结果（每个 context 各 1 次），不再用五次中位数充当单次对照。原五次中位数仍保留在上表作为稳定性参考。单次运行命令与结果见 [`Qwen35_Family_Coverage.md`](Qwen35_Family_Coverage.md)。
+
+| Context | Runtime | TTFT ms | TPOT ms | PP TPS | TG TPS | E2E s | Peak memory |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1K | MiniMLX (single run) | 2,176.0 | 57.20 | 470.6 | 17.64 | 8.79* | 18.464 GiB suite peak |
+| 1K | oMLX screenshot | 2,118.6 | 58.2 | 483.3 | 17.3 | 9.5 | 15.9 GB |
+| 4K | MiniMLX (single run) | 8,378.5 | 58.04 | 488.9 | 17.36 | 16.06 | 18.464 GiB suite peak |
+| 4K | oMLX screenshot | 7,969.5 | 57.8 | 514.0 | 17.4 | 15.3 | 17.0 GB |
+| 8K | MiniMLX (single run) | 17,513.0 | 59.28 | 467.8 | 17.00 | 25.35 | 18.464 GiB suite peak |
+| 8K | oMLX screenshot | 16,638.3 | 61.3 | 492.4 | 16.5 | 24.4 | 17.3 GB |
+| 16K | MiniMLX (single run) | 37,967.9 | 61.78 | 431.5 | 16.31 | 46.13 | 18.464 GiB suite peak |
+| 16K | oMLX screenshot | 36,426.9 | 60.4 | 449.8 | 16.7 | 44.1 | 17.8 GB |
+
+方向性上，截图中的 oMLX 在四个上下文的 TTFT、PP TPS 都更好，4K/8K/16K 的 E2E 也较低。TPOT/TG TPS 则是混合结果且差距较小：MiniMLX 在 1K/8K 的 TPOT 和 TG TPS 较好，oMLX 在 4K/16K 较好。MiniMLX 1K 实际生成 111/128，而截图未显示 oMLX 的实际生成数，所以该行 E2E/TG 不宜直接比较。单次样本显示的性能差距小于先前五次中位数表给人的印象；仍需统一设备、版本、warm-up、重复次数、step 和生成 token 数后才能下严格结论。峰值内存口径及 GB/GiB 也未对齐，不做严格胜负判断。
 
 ## 新模型记录模板
 

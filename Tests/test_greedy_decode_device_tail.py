@@ -1,4 +1,14 @@
-from minimlx_runtime.adapters.qwen35 import Qwen35Adapter
+import unittest
+from types import ModuleType
+from unittest.mock import patch
+
+# Import the adapter with a tiny fake MLX module. These tests exercise a pure
+# Python decode-tail helper and must remain runnable without Metal access.
+_mlx = ModuleType("mlx")
+_mlx_core = ModuleType("mlx.core")
+_mlx.core = _mlx_core
+with patch.dict("sys.modules", {"mlx": _mlx, "mlx.core": _mlx_core}):
+    from minimlx_runtime.adapters.qwen35 import Qwen35Adapter
 
 
 class FakeArray:
@@ -50,24 +60,28 @@ class FakeMx:
         pass
 
 
-def test_greedy_decode_tail_keeps_token_arrays_and_collects_once():
-    adapter = Qwen35Adapter()
-    model = FakeModel()
-    adapter.model = model
-    sampled = FakeArray([4])
+class GreedyDecodeDeviceTailTests(unittest.TestCase):
+    def test_tail_preserves_token_arrays_and_collects_once(self):
+        adapter = Qwen35Adapter()
+        model = FakeModel()
+        adapter.model = model
+        sampled = FakeArray([4])
 
-    tail = adapter._greedy_decode_device_tail(FakeMx, sampled, cache=object(), token_count=3)
+        tail = adapter._greedy_decode_device_tail(
+            FakeMx, sampled, cache=object(), token_count=3
+        )
 
-    assert tail == [5, 6, 7]
-    assert len(model.inputs) == 3
-    assert all(isinstance(tokens, FakeArray) for tokens in model.inputs)
-    assert sampled.values == [4]
+        self.assertEqual(tail, [5, 6, 7])
+        self.assertEqual(len(model.inputs), 3)
+        self.assertTrue(all(isinstance(tokens, FakeArray) for tokens in model.inputs))
+        self.assertEqual(sampled.values, [4])
 
+    def test_zero_token_tail_does_no_work(self):
+        adapter = Qwen35Adapter()
+        model = FakeModel()
+        adapter.model = model
 
-def test_greedy_decode_device_tail_with_zero_tokens_does_no_work():
-    adapter = Qwen35Adapter()
-    model = FakeModel()
-    adapter.model = model
-
-    assert adapter._greedy_decode_device_tail(FakeMx, FakeArray([4]), object(), 0) == []
-    assert model.inputs == []
+        self.assertEqual(
+            adapter._greedy_decode_device_tail(FakeMx, FakeArray([4]), object(), 0), []
+        )
+        self.assertEqual(model.inputs, [])
