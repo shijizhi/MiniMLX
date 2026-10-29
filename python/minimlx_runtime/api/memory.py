@@ -19,8 +19,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 GIB = 1024**3
-DEFAULT_RESERVE_RATIO = 0.20
-DEFAULT_MINIMUM_RESERVE = 4 * GIB
+DEFAULT_RESERVE_RATIO = 0.02
+DEFAULT_MINIMUM_RESERVE = int(1.5 * GIB)
+MAXIMUM_RESERVE = 4 * GIB
 
 
 @dataclass(frozen=True)
@@ -114,21 +115,21 @@ def read_system_memory() -> MemorySnapshot:
 
 
 def memory_reserve_bytes(total_bytes: int) -> int:
-    """A deliberately conservative floor, aligned with launch-time preflight."""
+    """Use oMLX aggressive-tier reserve: 2% of RAM, bounded to 1.5–4 GiB."""
     raw_ratio = os.environ.get("MINIMLX_MEMORY_RESERVE_RATIO")
     try:
         ratio = float(raw_ratio) if raw_ratio is not None else DEFAULT_RESERVE_RATIO
     except ValueError:
         ratio = DEFAULT_RESERVE_RATIO
-    ratio = min(0.50, max(0.10, ratio))
+    ratio = min(0.50, max(0.02, ratio))
 
     raw_minimum = os.environ.get("MINIMLX_MEMORY_RESERVE_GB")
     try:
         minimum = int(float(raw_minimum) * GIB) if raw_minimum is not None else DEFAULT_MINIMUM_RESERVE
     except ValueError:
         minimum = DEFAULT_MINIMUM_RESERVE
-    minimum = min(max(1 * GIB, minimum), max(1 * GIB, total_bytes // 2))
-    return min(total_bytes, max(int(total_bytes * ratio), minimum))
+    minimum = min(max(int(1.5 * GIB), minimum), max(int(1.5 * GIB), total_bytes // 2))
+    return min(total_bytes, MAXIMUM_RESERVE, max(int(total_bytes * ratio), minimum))
 
 
 def max_parallel_requests() -> int:

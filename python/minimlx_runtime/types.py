@@ -51,6 +51,8 @@ class ComponentKind(str, Enum):
     AUDIO_DECODER = "audio_decoder"
     VOCODER = "vocoder"
     DRAFT_WEIGHTS = "draft_weights"
+    ENGRAM_TABLE = "engram_table"
+    SPARSE_INDEXER = "sparse_indexer"
     WEIGHTS_SHARD = "weights_shard"
     OTHER = "other"
 
@@ -313,6 +315,8 @@ class RuntimeEnvironment:
     hardware: str | None = None
     available_memory_bytes: int | None = None
     features: frozenset[str] = frozenset()
+    disabled_optimizations: frozenset[str] = frozenset()
+    explicit_optimizations: frozenset[str] = frozenset()
     accelerations: frozenset[Acceleration] = frozenset()
     acceleration_components: dict[Acceleration, str] = field(default_factory=dict)
     acceleration_artifacts: dict[Acceleration, ModelDescriptor] = field(default_factory=dict)
@@ -362,6 +366,8 @@ class ExecutionPlan:
     acceleration_components: dict[Acceleration, str] = field(default_factory=dict)
     acceleration_adapters: dict[Acceleration, str] = field(default_factory=dict)
     acceleration_component_kinds: dict[Acceleration, ComponentKind] = field(default_factory=dict)
+    baseline_provider: str | None = None
+    optimization_providers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.acceleration_adapters.keys() != self.acceleration_component_kinds.keys():
@@ -379,6 +385,7 @@ class GenerationResult:
     text: str
     prefill_ms: float
     decode_ms: float
+    ttft_ms: float | None = None
 
     @property
     def decode_tokens_per_second(self) -> float:

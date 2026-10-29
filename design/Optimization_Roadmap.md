@@ -213,3 +213,34 @@ KV cache 方向的公开依据：MLX-LM 已提供 `--kv-bits`、`--kv-group-size
 已完成首轮验证并接入 opt-in runtime：4K 扩展请求约 6.4x，16K 扩展请求约
 28.3x；缓存状态采用显式克隆，保留冷请求路径。缓存不是冻结；当前只延后长上下文
 SSD/paged cache。命中/未命中遥测和淘汰策略属于后续工程项，不插入当前性能优化循环。
+
+## Llama 3.2 3B Q4 性能专项（2026-10-25）
+
+目标：判断 oMLX 与 MiniMLX 的 Llama 单请求差异是否来自可移植的模型计算优化；
+只在相同 checkpoint、prompt、输出长度和重复统计下评估候选。`mlx-lm-standard` 基线
+保持不变；只有经验证的 Llama 专属收益才允许进入独立叠加层。
+
+### 计划及执行结果
+
+| 步骤 | 状态 | 结果与决定 |
+|---|---|---|
+| 核实 oMLX Llama 专属实现和服务层差异 | 完成 | 当前公开模型加载分发没有 Llama 3.2 专属热路径补丁，只有 Llama 4 attention patch。连续批处理、分页 KV/prefix cache 是服务引擎能力，不能解释单请求结果。现有 DFlash/MTP 路径也没有该 checkpoint 可用的 drafter。 |
+| 重建 MiniMLX 标准基线 | 完成 | M5 Pro 64 GB、MLX-LM 标准文本路径、Q4 affine/group64、代码语料、1K/4K/8K/16K、warm-up 32、生成 128、step 1024、5 次 median。数据见 `Model_Benchmark_Comparison.md` 新增复测段。 |
+| Q4 MLP BF16 预解量化 | 完成/否决 | 28/28 层，额外常驻约 3.94 GiB。1K 近似无收益；4K TTFT 约慢 28%、decode 约慢 44%；16K TTFT 约慢 29%、decode 约慢 58%，且 16K 输出 token 与基线不一致。不得进入运行时。 |
+| Q4 gate/up 单次 QMM 融合 | 完成/否决 | 1K E2E 约慢 0.4%；4K TTFT/E2E 约慢 1.2%/0.8%；16K TTFT/E2E 约慢 0.3%/0.1%。token 一致，但没有端到端收益。 |
+| Prefill chunk 512/1024/2048 | 完成 | 512 在 4K/16K 没有优势。平衡顺序 5 次 A/B 中，2048 相对 1024 在 4K TTFT 快 2.43%、E2E 快 1.21%；8K TTFT 快 2.61%、E2E 快 1.35%；两档 token 序列完全一致。16K 中位数没有改善，样本受明显运行波动影响。 |
+| 决定是否新增 Llama 性能层 | 完成/不新增 | `StandardTextAdapter.generate()` 的默认 prefill step 已是 2048；实测的小幅收益来自 benchmark 显式使用 1024 后改回 2048，不需要模型专属代码。BF16 MLP 与融合候选均已否决。 |
+
+### 验收结论
+
+- Llama 3.2 继续走 `mlx-lm-standard` 通用基线。本轮没有新增模型 Adapter、Llama overlay
+  或生产 kernel，避免把无收益实验变成维护负担。
+- 留下 chunk A/B 的可复现入口：
+  `tools/experiment_llama_prefill_steps.py <model-dir> <prompt-file> --contexts 4096 8192 16384 --steps 1024 2048 --repeats 5`。
+- 16K A/B 样本曾出现约 5–14 秒 TTFT 的大幅跨度，另一次 2048 全矩阵也出现显著漂移；
+  该次矩阵不用于性能结论。制定 16K 长度门控前，需确保没有其他 MLX/oMLX 推理任务占用
+  GPU，并在同一进程内交错复测。
+- 后续若继续追求 Llama 长上下文性能，先对 16K prefill/decode 做阶段 profile，确认具体
+  热点后再开新专项；不凭模型名称猜测 attention 或 cache 补丁。
+- 与 oMLX 的既有截图比较仍是参考数据：统计口径、运行时状态不完全一致；不据此宣称
+  已追平，也不把连续批处理 TPS 当成单请求指标。

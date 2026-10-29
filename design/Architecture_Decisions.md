@@ -68,10 +68,22 @@ to real task-level correctness tests.
    `VLMModelAdapter` split and LM Studio's separate batched-vision model kit.
 10. **VLM families share one execution implementation.** The family-neutral
     `MLXVLMAdapter` owns `mlx-vlm` loading, ordered message/template processing,
-    image validation, generation, and streaming. Qwen3.5 inherits this path;
-    its family adapter only supplies the measured vision/preprocessing cache
-    hooks. New VL families should use the shared route first, adding family
-    code only for demonstrated correctness or performance needs.
+    image validation, generation, and streaming. Qwen3.5 reuses this baseline;
+    its version-scoped vision/preprocessing cache is an optional optimization
+    overlay. New VL families should use the shared route first, adding family
+    code only for demonstrated correctness gaps and adding optimization overlays
+    only with measurable evidence.
+11. **Model execution is two stacked layers: a generic baseline plus optional
+    optimization overlays.** Every supported model has a complete baseline route
+    through the applicable upstream backend (MLX-LM, MLX-VLM, etc.); it remains
+    usable when all MiniMLX optimizations are disabled. An optimization requires
+    a measured baseline, a named bottleneck and method, correctness parity, a
+    repeatable target metric, explicit applicability gates, and fallback to the
+    same model's baseline. It composes with and reuses that baseline, replacing
+    only the proven hot path. Family adapters exist for structural/correctness
+    differences and are not a synonym for optimization overlays. Model-version
+    scope is explicit: Qwen3.5 and Qwen3.8 optimizations are separate; Llama uses
+    the generic baseline unless Llama-specific evidence justifies an overlay.
 
 ## Consequences and open gates
 
@@ -83,6 +95,16 @@ to real task-level correctness tests.
   this does not imply every upstream `mlx-vlm` architecture is validated.
   Other task families remain unsupported/dependency-blocked until their own
   executor and correctness evidence are delivered.
+- The baseline-plus-overlay architecture is implemented in route planning and
+  loading: plans record baseline and optimization providers, Qwen3.5 loads the
+  standard MLX-LM/MLX-VLM baseline before applying its gated overlay, and a
+  failed optional overlay is retried on the baseline. Repository identity
+  excludes Qwen3.8 from Qwen3.5 providers and routes it to shared MLX-LM/MLX-VLM.
+  Overlay installation coordination lives in `qwen35_overlay.py`; Qwen3.5-only
+  optimization hooks, greedy decode, specialized generation, and profiling live
+  in `qwen35_optimization.py` and are composed by the overlay. `Qwen35Adapter`
+  owns model lifecycle and MTP/DFlash acceleration routing, not optimization
+  algorithms.
 - VLM routes delegate the final generation loop to `mlx-vlm`; the native model
   `get_input_embeddings` path performs multimodal prefill and token decode. A
   MiniMLX-owned prefill adapter is still required before adding continuous

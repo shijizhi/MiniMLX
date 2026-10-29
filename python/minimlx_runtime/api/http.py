@@ -7,15 +7,17 @@ import hmac
 import ipaddress
 import logging
 import sqlite3
+import socket
 import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 from ..runtime import Runtime
+from ..errors import SupportResolutionError
 from ..types import ContentPart, InferenceRequest, InputMessage, ModelTask, Modality, VideoFrame
 from .memory import (
     InferenceAdmission,
@@ -27,6 +29,20 @@ from .memory import (
 
 DEFAULT_API_MAX_TOKENS = 32768
 DEFAULT_MAX_PREFILL_STEP_SIZE = 2048
+
+
+class _DualStackHTTPServer(HTTPServer):
+    """Bind an IPv6 wildcard socket and keep MLX calls on the owner thread."""
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+# Retain the old import name for existing callers/tests.
+_DualStackThreadingHTTPServer = _DualStackHTTPServer
 
 
 class _ApiTelemetry:
@@ -273,6 +289,7 @@ def _infer(
             "repetition_penalty",
             "presence_penalty",
             "frequency_penalty",
+            "ignore_eos",
             "context_tokens",
             "max_context_tokens",
             "prefill_step_size",
@@ -282,6 +299,8 @@ def _infer(
     }
     if "max_completion_tokens" in options and "max_tokens" not in options:
         options["max_tokens"] = options.pop("max_completion_tokens")
+    if "ignore_eos" in options and not isinstance(options["ignore_eos"], bool):
+        raise ValueError("ignore_eos must be a boolean")
     options.setdefault("max_tokens", default_max_tokens)
     request = InferenceRequest(
         task=ModelTask.GENERATION,
@@ -291,27 +310,7 @@ def _infer(
     )
     if not request.stream:
         return request, runtime.infer(request)
-    has_multimodal = any(
-        part.modality in (Modality.IMAGE, Modality.VIDEO)
-        for message in request.messages
-        for part in message.content
-    )
-    if has_multimodal:
-        return request, runtime.infer_stream(request)
-    # The text adapter currently yields complete results rather than token events.
-    # Preserve the OpenAI SSE contract while making that latency explicit in behavior.
-    result = runtime.infer(replace(request, stream=False))
-
-    def buffered_events():
-        yield {"event": "delta", "delta": result.payload.text}
-        yield {
-            "event": "done",
-            "text": result.payload.text,
-            "usage": result.usage,
-            "metrics": result.metrics,
-        }
-
-    return request, buffered_events()
+    return request, runtime.infer_stream(request)
 
 
 def _anthropic_request(body: dict[str, Any]) -> dict[str, Any]:
@@ -390,7 +389,47 @@ def _model_id(runtime: Runtime, alias: str | None = None) -> str:
     if alias:
         return alias
     model_dir = getattr(getattr(runtime, "descriptor", None), "model_dir", "minimlx")
-    return str(model_dir).rstrip("/").split("/")[-1]
+    path = Path(model_dir).expanduser()
+
+    # Match oMLX's public model ID: use the model's directory leaf (or an
+    # explicit alias), not the publisher-prefixed flattened download folder.
+    try:
+        repo_id = (path / ".minimlx-repo-id").read_text(encoding="utf-8").strip()
+    except OSError:
+        repo_id = ""
+    if repo_id and "/" in repo_id:
+        return repo_id.rsplit("/", 1)[-1]
+
+    # Hugging Face cache snapshots encode the repository as
+    # models--publisher--name/snapshots/<revision>.
+    if path.parent.name == "snapshots" and path.parent.parent.name.startswith("models--"):
+        return path.parent.parent.name.removeprefix("models--").split("--", 1)[-1]
+
+    name = path.name or "minimlx"
+    # MiniMLX's own downloader flattens publisher/repository IDs with `--`.
+    # Keep this fallback for older downloads without the identity marker.
+    return name.split("--", 1)[-1] if "--" in name else name
+
+
+def _is_requested_model(runtime: Runtime, requested: Any, model_id: str, alias: str | None) -> bool:
+    if not isinstance(requested, str) or not requested.strip():
+        return False
+    requested = requested.strip().casefold()
+    path = Path(getattr(getattr(runtime, "descriptor", None), "model_dir", ""))
+    candidates = {model_id.casefold(), path.name.casefold()}
+    if alias:
+        candidates.add(alias.casefold())
+    try:
+        repo_id = (path / ".minimlx-repo-id").read_text(encoding="utf-8").strip()
+    except OSError:
+        repo_id = ""
+    if repo_id:
+        candidates.update((repo_id.casefold(), repo_id.rsplit("/", 1)[-1].casefold()))
+
+    # oMLX accepts provider-qualified IDs such as publisher/model by resolving
+    # the final path component against its local model ID.
+    requested_leaf = requested.rsplit("/", 1)[-1]
+    return requested in candidates or requested_leaf in candidates
 
 
 def _apply_model_defaults(
@@ -481,6 +520,7 @@ def serve_http(
     api_key: str | None = None,
     default_options: dict[str, Any] | None = None,
     log_level: str = "INFO",
+    log_file_path: str | None = None,
     history_db_path: str | None = None,
     model_alias: str | None = None,
     force_sampling: bool = False,
@@ -512,15 +552,68 @@ def serve_http(
     memory_monitor = SystemMemoryMonitor(
         additional_reserve_bytes=estimated_request_memory
     )
-    logging.getLogger().setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    if log_file_path:
+        from pathlib import Path
+
+        log_path = Path(log_file_path).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        class _JsonLogFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                return json.dumps(
+                    {
+                        "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "message": record.getMessage(),
+                        "exception": self.formatException(record.exc_info)
+                        if record.exc_info
+                        else None,
+                    },
+                    ensure_ascii=False,
+                )
+
+        if not any(
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename) == log_path.resolve()
+            for handler in root_logger.handlers
+        ):
+            handler = logging.FileHandler(log_path, encoding="utf-8")
+            handler.setFormatter(_JsonLogFormatter())
+            root_logger.addHandler(handler)
+    logger = logging.getLogger("minimlx.api")
+    logger.info("MiniMLX API started (model=%s)", model_id)
+
+    def log_model_call(
+        path: str,
+        status: str,
+        started: float,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        error: str | None = None,
+    ) -> None:
+        fields = [
+            "model_call",
+            f"path={path}",
+            f"model={model_id}",
+            f"status={status}",
+            f"duration_ms={(time.perf_counter() - started) * 1000:.1f}",
+            f"prompt_tokens={prompt_tokens}",
+            f"completion_tokens={completion_tokens}",
+        ]
+        if error:
+            fields.append(f"error={error!r}")
+        logger.info("%s", " ".join(fields))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MiniMLX/0.1"
 
         def log_message(self, _format: str, *args: object) -> None:
-            logger = logging.getLogger("minimlx.api")
-            if logger.isEnabledFor(logging.INFO):
-                print("MiniMLX API: " + (_format % args), flush=True)
+            # Health, telemetry, metrics, and model-list polling are internal
+            # UI traffic. Model calls are logged explicitly below with useful
+            # inference details instead of noisy access-log lines.
+            return
 
         def _json(
             self,
@@ -640,6 +733,14 @@ def serve_http(
                 if content_length <= 0 or content_length > 128 * 1024 * 1024:
                     raise ValueError("request body must be between 1 byte and 128 MiB")
                 body = json.loads(self.rfile.read(content_length))
+                requested_model = body.get("model")
+                if requested_model is not None and not _is_requested_model(
+                    runtime, requested_model, model_id, model_alias
+                ):
+                    raise ValueError(
+                        f"unknown model {requested_model!r}; use the model ID "
+                        f"returned by GET /v1/models (currently {model_id!r})"
+                    )
                 is_anthropic = self.path == "/v1/messages"
                 is_completion = self.path == "/v1/completions"
                 if is_completion:
@@ -651,20 +752,40 @@ def serve_http(
                     body, default_options, force_sampling, default_max_tokens
                 )
                 request, result = _infer(runtime, body, default_max_tokens)
+                stream_options = body.get("stream_options", {})
+                if not isinstance(stream_options, dict):
+                    raise ValueError("stream_options must be an object")
+                include_usage = stream_options.get("include_usage", False)
+                if not isinstance(include_usage, bool):
+                    raise ValueError("stream_options.include_usage must be a boolean")
                 response_id = "chatcmpl-" + uuid.uuid4().hex
+                response_created = int(time.time())
                 if request.stream:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
                     self.end_headers()
                     response_started = True
+                    if not is_anthropic and not is_completion:
+                        role_chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": response_created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                        }
+                        self.wfile.write(("data: " + json.dumps(role_chunk) + "\n\n").encode())
+                        self.wfile.flush()
                     if is_anthropic:
                         self.wfile.write(("event: message_start\ndata: " + json.dumps({"type": "message_start", "message": {"id": response_id, "type": "message", "role": "assistant", "model": model_id, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}}) + "\n\n").encode())
                         self.wfile.write(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+                    stream_done = False
                     for event in result:
                         text = event.get("delta") or ""
-                        completion_tokens += len(event.get("token_ids") or [])
+                        token_ids = event.get("token_ids") or []
+                        completion_tokens += len(token_ids)
                         if event.get("event") == "done":
+                            stream_done = True
                             usage = event.get("usage") or {}
                             prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
                             completion_tokens = int(
@@ -682,9 +803,11 @@ def serve_http(
                                 self.wfile.write(("event: content_block_delta\ndata: " + json.dumps(packet, ensure_ascii=False) + "\n\n").encode())
                             else:
                                 choice = {"index": 0, "text": text, "finish_reason": None} if is_completion else {"index": 0, "delta": {"content": text}, "finish_reason": None}
-                                chunk = {"id": response_id, "object": "text_completion" if is_completion else "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [choice]}
+                                chunk = {"id": response_id, "object": "text_completion" if is_completion else "chat.completion.chunk", "created": response_created, "model": model_id, "choices": [choice]}
                                 self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode())
                             self.wfile.flush()
+                    if not stream_done:
+                        raise RuntimeError("stream ended before its completion event")
                     finish_reason = _finish_reason(request, completion_tokens)
                     if is_anthropic:
                         stop_reason = "max_tokens" if finish_reason == "length" else "end_turn"
@@ -694,11 +817,26 @@ def serve_http(
                         self.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
                         self.wfile.flush()
                         telemetry.finish(model=model_id, started=started, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, prefill_ms=prefill_ms, decode_ms=decode_ms, vision_cache_hits=vision_cache_hits, vision_cache_misses=vision_cache_misses)
+                        log_model_call(self.path, "complete", started, prompt_tokens, completion_tokens)
                         recorded = True
                         return
                     final_choice = {"index": 0, "text": "", "finish_reason": finish_reason} if is_completion else {"index": 0, "delta": {}, "finish_reason": finish_reason}
-                    final_chunk = {"id": response_id, "object": "text_completion" if is_completion else "chat.completion.chunk", "created": int(time.time()), "model": model_id, "choices": [final_choice]}
+                    final_chunk = {"id": response_id, "object": "text_completion" if is_completion else "chat.completion.chunk", "created": response_created, "model": model_id, "choices": [final_choice]}
                     self.wfile.write(("data: " + json.dumps(final_chunk) + "\n\n").encode())
+                    if include_usage:
+                        usage_chunk = {
+                            "id": response_id,
+                            "object": "text_completion" if is_completion else "chat.completion.chunk",
+                            "created": response_created,
+                            "model": model_id,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
+                            },
+                        }
+                        self.wfile.write(("data: " + json.dumps(usage_chunk) + "\n\n").encode())
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                     telemetry.finish(
@@ -711,6 +849,7 @@ def serve_http(
                         vision_cache_hits=vision_cache_hits,
                         vision_cache_misses=vision_cache_misses,
                     )
+                    log_model_call(self.path, "complete", started, prompt_tokens, completion_tokens)
                     recorded = True
                     return
                 text = result.payload.text
@@ -734,6 +873,7 @@ def serve_http(
                         "usage": {"input_tokens": prompt_tokens, "output_tokens": completion_tokens},
                     })
                     telemetry.finish(model=model_id, started=started, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, prefill_ms=prefill_ms, decode_ms=decode_ms, vision_cache_hits=vision_cache_hits, vision_cache_misses=vision_cache_misses)
+                    log_model_call(self.path, "complete", started, prompt_tokens, completion_tokens)
                     recorded = True
                     return
                 choice = (
@@ -759,8 +899,19 @@ def serve_http(
                     vision_cache_hits=vision_cache_hits,
                     vision_cache_misses=vision_cache_misses,
                 )
+                log_model_call(self.path, "complete", started, prompt_tokens, completion_tokens)
                 recorded = True
             except Exception as exc:
+                if not isinstance(
+                    exc,
+                    (SupportResolutionError, ValueError, TypeError, json.JSONDecodeError),
+                ):
+                    logging.getLogger("minimlx.api").exception(
+                        "Unhandled API request error (path=%s, model=%s)",
+                        self.path,
+                        model_id,
+                    )
+                log_model_call(self.path, "failed", started, prompt_tokens, completion_tokens, str(exc))
                 if response_started:
                     error_code = (
                         "memory_pressure"
@@ -785,23 +936,33 @@ def serve_http(
                                 ("event: error\ndata: " + json.dumps(packet, ensure_ascii=False) + "\n\n").encode()
                             )
                         else:
-                            self.wfile.write(
-                                ("data: " + json.dumps({"error": error}, ensure_ascii=False) + "\n\n").encode()
-                            )
+                            error_packet = json.dumps({"error": error}, ensure_ascii=False)
+                            # Intentionally omit [DONE] so clients cannot count failure as success.
+                            self.wfile.write(("event: error\ndata: " + error_packet + "\n\n").encode())
                         self.wfile.flush()
+                        self.close_connection = True
                     except OSError:
                         logging.getLogger("minimlx.api").debug(
                             "Client disconnected while reporting an interrupted stream"
                         )
                 else:
-                    self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+                    status = (
+                        422
+                        if isinstance(exc, SupportResolutionError)
+                        else 400
+                        if isinstance(exc, (ValueError, TypeError, json.JSONDecodeError))
+                        else 500
+                    )
+                    error_type = "invalid_request_error" if status < 500 else "server_error"
+                    self._json(status, {"error": {"message": str(exc), "type": error_type}})
             finally:
                 if not recorded:
                     telemetry.finish(model=model_id, started=started, failed=True)
                 inference_admission.release()
 
-    server = ThreadingHTTPServer((host, port), Handler)
-    print(f"MiniMLX API listening at http://{host}:{port}/v1 (model={model_id})", flush=True)
+    server_type = _DualStackHTTPServer if host == "::" else HTTPServer
+    server = server_type((host, port), Handler)
+    logger.info("MiniMLX API listening at http://%s:%s/v1 (model=%s)", host, port, model_id)
     try:
         memory_monitor.start()
         server.serve_forever()

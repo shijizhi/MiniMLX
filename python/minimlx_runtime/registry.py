@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
+from .model_catalog import STANDARD_MLX_LM_TEXT_FAMILIES
 from .types import (
     Acceleration,
     AccelerationArtifactRequirement,
@@ -46,6 +47,7 @@ class AdapterRole(str, Enum):
     FAMILY = "family"
     BACKEND = "backend"
     COMPONENT = "component"
+    OPTIMIZATION = "optimization"
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,9 @@ class AdapterRegistration:
     input_modalities: frozenset[Modality] = frozenset()
     output_modalities: frozenset[Modality] = frozenset()
     families: tuple[str, ...] = ()
+    compatible_family_adapters: tuple[str, ...] = ()
+    required_model_versions: tuple[str, ...] = ()
+    excluded_model_versions: tuple[str, ...] = ()
     backend: str | None = None
     component_kind: ComponentKind | None = None
     required_components: frozenset[ComponentKind] = frozenset()
@@ -110,6 +115,21 @@ class AdapterRegistration:
         if self.tasks and request.task not in self.tasks:
             return ()
         model_facts = f"{descriptor.model_type} {descriptor.architecture}".lower()
+        identity = str(
+            descriptor.metadata.get("repository_id")
+            or Path(descriptor.model_dir).name
+        ).lower()
+        identity_compact = re.sub(r"[^a-z0-9]+", "", identity)
+        if self.required_model_versions and not any(
+            re.sub(r"[^a-z0-9]+", "", version.lower()) in identity_compact
+            for version in self.required_model_versions
+        ):
+            return ()
+        if any(
+            re.sub(r"[^a-z0-9]+", "", version.lower()) in identity_compact
+            for version in self.excluded_model_versions
+        ):
+            return ()
         if self.families and not any(token.lower() in model_facts for token in self.families):
             return ()
         if self.input_modalities and not {
@@ -349,6 +369,23 @@ class CapabilityResolver:
             )
         selected_tuple = min(viable or structural, key=rank)
         selected = dict(zip(role_order, selected_tuple, strict=True))
+        optimization_providers = tuple(
+            registration.name
+            for registration in self.providers.candidates(
+                AdapterRole.OPTIMIZATION, descriptor, request
+            )
+            if (
+                not registration.compatible_family_adapters
+                or selected[AdapterRole.FAMILY].name
+                in registration.compatible_family_adapters
+            )
+            if registration.name not in environment.disabled_optimizations
+            if (
+                not registration.accelerations
+                or registration.accelerations & environment.accelerations
+            )
+            if self._base_requirements_met((registration,), environment)
+        )
 
         required_component_kinds = frozenset(
             kind
@@ -384,7 +421,15 @@ class CapabilityResolver:
                 ),
                 None,
             )
-        selected_registrations = (*selected.values(), *selected_components.values())
+        selected_registrations = (
+            *selected.values(),
+            *selected_components.values(),
+            *(
+                registration
+                for registration in self.providers.registrations
+                if registration.name in optimization_providers
+            ),
+        )
 
         raw_accelerations = request.accelerations
         legacy_accelerations = request.options.get("accelerations")
@@ -673,6 +718,11 @@ class CapabilityResolver:
             if component_path:
                 component_paths.setdefault(ComponentKind.DRAFT_WEIGHTS, ())
                 component_paths[ComponentKind.DRAFT_WEIGHTS] += (component_path,)
+        family_provider = selected[AdapterRole.FAMILY].name
+        baseline_provider = {
+            "qwen35-mlx-lm": "mlx-lm-standard",
+            "qwen35-vlm": "mlx-vlm-generation",
+        }.get(family_provider, family_provider)
         plan = ExecutionPlan(
             phase="inference",
             task=request.task,
@@ -689,8 +739,14 @@ class CapabilityResolver:
             },
             acceleration_adapters=acceleration_adapters,
             acceleration_component_kinds=acceleration_component_kinds,
+            baseline_provider=baseline_provider,
+            optimization_providers=optimization_providers,
         )
-        provider_names = tuple(dict.fromkeys(item.name for item in selected.values()))
+        provider_names = tuple(
+            dict.fromkeys(
+                (*[item.name for item in selected.values()], *optimization_providers)
+            )
+        )
         return (
             SupportDecision(
                 status=SupportStatus.SUPPORTED,
@@ -710,6 +766,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.TOKENIZER,
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(
@@ -717,6 +774,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.TEXT_WEIGHTS,
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(
@@ -724,6 +782,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.PROCESSOR,
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(
@@ -731,6 +790,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.VISION_ENCODER,
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(
@@ -758,10 +818,32 @@ def builtin_provider_registry() -> ProviderRegistry:
                 priority=50,
             ),
             AdapterRegistration(
+                name="deepseek41-engram-component",
+                roles=frozenset({AdapterRole.COMPONENT}),
+                component_kind=ComponentKind.ENGRAM_TABLE,
+                required_model_versions=("deepseek-v4.1",),
+                priority=120,
+            ),
+            AdapterRegistration(
+                name="deepseek41-sparse-indexer-component",
+                roles=frozenset({AdapterRole.COMPONENT}),
+                component_kind=ComponentKind.SPARSE_INDEXER,
+                required_model_versions=("deepseek-v4.1",),
+                priority=120,
+            ),
+            AdapterRegistration(
+                name="deepseek41-dspark-component",
+                roles=frozenset({AdapterRole.COMPONENT}),
+                component_kind=ComponentKind.DRAFT_WEIGHTS,
+                required_model_versions=("deepseek-v4.1",),
+                priority=120,
+            ),
+            AdapterRegistration(
                 name="qwen35-mtp-draft-component",
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.DRAFT_WEIGHTS,
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(
@@ -772,40 +854,76 @@ def builtin_provider_registry() -> ProviderRegistry:
                 # draft identity/compatibility is validated separately from
                 # the acceleration artifact descriptor below.
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(
-                name="qwen2-tokenizer-component",
+                name="dflash-draft-component",
+                roles=frozenset({AdapterRole.COMPONENT}),
+                component_kind=ComponentKind.DRAFT_WEIGHTS,
+                required_model_versions=("qwen3.8",),
+                priority=110,
+            ),
+            AdapterRegistration(
+                name="mlx-lm-tokenizer-component",
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.TOKENIZER,
-                families=("qwen2forcausallm",),
+                families=STANDARD_MLX_LM_TEXT_FAMILIES + ("qwen3_5", "qwen3.5"),
                 priority=100,
             ),
             AdapterRegistration(
-                name="qwen2-text-weights-component",
+                name="mlx-lm-text-weights-component",
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.TEXT_WEIGHTS,
-                families=("qwen2forcausallm",),
+                families=STANDARD_MLX_LM_TEXT_FAMILIES + ("qwen3_5", "qwen3.5"),
                 priority=100,
             ),
         ]
     registrations.extend(
         [
             AdapterRegistration(
-                name="qwen2-mlx-lm",
+                name="mlx-lm-standard",
                 roles=frozenset(
                     {AdapterRole.TASK, AdapterRole.FAMILY, AdapterRole.BACKEND}
                 ),
                 tasks=frozenset({ModelTask.GENERATION}),
                 input_modalities=frozenset({Modality.TEXT}),
                 output_modalities=frozenset({Modality.TEXT}),
-                families=("qwen2forcausallm",),
-                backend="qwen2-runtime",
+                families=STANDARD_MLX_LM_TEXT_FAMILIES + ("qwen3_5", "qwen3.5"),
+                backend="mlx-lm-standard-runtime",
                 required_components=frozenset(
                     {ComponentKind.TOKENIZER, ComponentKind.TEXT_WEIGHTS}
                 ),
                 required_dependencies=frozenset({"mlx-lm"}),
-                priority=100,
+                supports_streaming=True,
+                priority=80,
+            ),
+            AdapterRegistration(
+                name="qwen38-dflash-acceleration",
+                roles=frozenset({AdapterRole.OPTIMIZATION}),
+                tasks=frozenset({ModelTask.GENERATION}),
+                required_model_versions=("qwen3.8",),
+                compatible_family_adapters=("mlx-lm-standard",),
+                supports_streaming=True,
+                accelerations=frozenset({Acceleration.DFLASH}),
+                acceleration_dependencies=((Acceleration.DFLASH, frozenset({"dflash"})),),
+                acceleration_artifact_requirements=(
+                    (
+                        Acceleration.DFLASH,
+                        AccelerationArtifactRequirement(
+                            model_types=frozenset({"dflash", "dflash2"}),
+                            architecture_tokens=("dflashdraftmodel", "dflash2draftmodel"),
+                            component_kinds=frozenset(
+                                {ComponentKind.DRAFT_WEIGHTS, ComponentKind.WEIGHTS_SHARD}
+                            ),
+                            matching_metadata_keys=("hidden_size", "vocab_size"),
+                        ),
+                    ),
+                ),
+                acceleration_component_adapters=(
+                    (Acceleration.DFLASH, ComponentKind.DRAFT_WEIGHTS, "dflash-draft-component"),
+                ),
+                priority=110,
             ),
             AdapterRegistration(
                 name="qwen35-mlx-lm",
@@ -816,6 +934,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                 input_modalities=frozenset({Modality.TEXT}),
                 output_modalities=frozenset({Modality.TEXT}),
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 backend="qwen35-runtime",
                 required_components=frozenset(
                     {ComponentKind.TOKENIZER, ComponentKind.TEXT_WEIGHTS}
@@ -865,11 +984,21 @@ def builtin_provider_registry() -> ProviderRegistry:
                         "qwen35-dflash-draft-component",
                     ),
                 ),
+                supports_streaming=True,
                 # Text-only requests must win over the vision-capable
                 # provider. Qwen3.x checkpoints advertise vision metadata
                 # even when no media is present; Rapid-MLX uses the same
                 # explicit text-only lane to avoid MLLM overhead.
                 priority=120,
+            ),
+            AdapterRegistration(
+                name="qwen35-performance-overlay",
+                roles=frozenset({AdapterRole.OPTIMIZATION}),
+                tasks=frozenset({ModelTask.GENERATION}),
+                families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
+                supports_streaming=True,
+                priority=100,
             ),
             # Vision-language execution is a separate provider so the
             # resolver can require both the VLM dependency and the checkpoint
@@ -883,6 +1012,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                 input_modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
                 output_modalities=frozenset({Modality.TEXT}),
                 families=("qwen3_5", "qwen3.5"),
+                excluded_model_versions=("qwen3.8",),
                 backend="qwen35-vlm",
                 required_components=frozenset(
                     {
@@ -898,7 +1028,11 @@ def builtin_provider_registry() -> ProviderRegistry:
             ),
             # Family-neutral VLM route. mlx-vlm owns architecture-specific
             # loading/preprocessing; this registration only requires the
-            # checkpoint's actual vision components and shared backend.
+            # checkpoint's actual vision components and shared backend. It
+            # is a fallback for checkpoints without a compatible text-only
+            # provider. Text-only requests should use the standard MLX-LM
+            # route when available; image/video requests match this provider
+            # because the text-only route does not accept those modalities.
             AdapterRegistration(
                 name="mlx-vlm-generation",
                 roles=frozenset(
@@ -920,6 +1054,53 @@ def builtin_provider_registry() -> ProviderRegistry:
                 supports_streaming=True,
                 priority=70,
             ),
+            AdapterRegistration(
+                name="qwen38-vlm",
+                roles=frozenset(
+                    {AdapterRole.TASK, AdapterRole.FAMILY, AdapterRole.BACKEND}
+                ),
+                tasks=frozenset({ModelTask.GENERATION}),
+                input_modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+                output_modalities=frozenset({Modality.TEXT}),
+                families=("qwen4_exp",),
+                backend="mlx-vlm-runtime",
+                required_components=frozenset(
+                    {
+                        ComponentKind.TOKENIZER,
+                        ComponentKind.TEXT_WEIGHTS,
+                        ComponentKind.PROCESSOR,
+                        ComponentKind.VISION_ENCODER,
+                    }
+                ),
+                required_dependencies=frozenset({"mlx-vlm"}),
+                supports_streaming=True,
+                priority=130,
+            ),
+            AdapterRegistration(
+                name="deepseek41-mlx-vlm",
+                roles=frozenset(
+                    {AdapterRole.TASK, AdapterRole.FAMILY, AdapterRole.BACKEND}
+                ),
+                tasks=frozenset({ModelTask.GENERATION}),
+                input_modalities=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
+                output_modalities=frozenset({Modality.TEXT}),
+                required_model_versions=("deepseek-v4.1",),
+                backend="deepseek41-mlx-vlm-runtime",
+                required_components=frozenset(
+                    {
+                        ComponentKind.TOKENIZER,
+                        ComponentKind.TEXT_WEIGHTS,
+                        ComponentKind.PROCESSOR,
+                        ComponentKind.VISION_ENCODER,
+                        ComponentKind.ENGRAM_TABLE,
+                        ComponentKind.SPARSE_INDEXER,
+                        ComponentKind.DRAFT_WEIGHTS,
+                    }
+                ),
+                required_dependencies=frozenset({"mlx-vlm"}),
+                supports_streaming=True,
+                priority=140,
+            ),
         ]
     )
     return ProviderRegistry(registrations)
@@ -938,6 +1119,12 @@ def describe_model(model_dir: str | Path) -> ModelDescriptor:
     if isinstance(architectures, str):
         architectures = [architectures]
     architecture = str(architectures[0] if architectures else model_type)
+    identity_marker = path / ".minimlx-repo-id"
+    repository_id = (
+        identity_marker.read_text().strip()
+        if identity_marker.is_file()
+        else path.name
+    ) or path.name
     text_config = config.get("text_config")
     if not isinstance(text_config, dict):
         text_config = {}
@@ -951,9 +1138,51 @@ def describe_model(model_dir: str | Path) -> ModelDescriptor:
         capabilities.add("moe")
     family_facts = f"{model_type} {architecture}".lower()
     is_qwen35 = re.search(r"qwen3[._-]5", family_facts) is not None
+    # Qwen3.8-Flash-Next checkpoints have appeared with both the canonical
+    # qwen3_next model type and repository names containing qwen3.8.  Keep
+    # this fact separate from the Qwen3.5 route so the offload planner can
+    # select the correct execution lane without making the generic loader
+    # claim support for an unverified architecture.
+    is_qwen38_flash_next = (
+        re.search(r"qwen3[._-]8", family_facts) is not None
+        or "qwen3_next" in family_facts
+        or "qwen4_exp" in family_facts
+        or "flash-next" in repository_id.lower()
+    )
+    is_deepseek41_flash = (
+        re.search(r"deepseek[._-]?v4[._-]?1", family_facts) is not None
+        or "deepseek-v4.1-flash" in repository_id.lower()
+    )
     if is_qwen35:
         capabilities.update(
             {"prefill", "decode", "single_request", "hybrid_attention", "recurrent_state"}
+        )
+    if is_qwen38_flash_next:
+        capabilities.update(
+            {
+                "prefill",
+                "decode",
+                "single_request",
+                "hybrid_attention",
+                "recurrent_state",
+                "moe",
+                "ngram_embedding",
+                "ssd_offload_candidate",
+            }
+        )
+    if is_deepseek41_flash:
+        capabilities.update(
+            {
+                "prefill",
+                "decode",
+                "single_request",
+                "causal_encoder_decoder",
+                "compressed_sparse_attention",
+                "engram_memory",
+                "hyper_connections",
+                "dspark_mtp",
+                "ssd_offload_candidate",
+            }
         )
     vision_config_keys = (
         "vision_config", "vit_config", "mm_vision_tower", "vision_tower",
@@ -975,9 +1204,15 @@ def describe_model(model_dir: str | Path) -> ModelDescriptor:
     if has_video:
         input_modalities.add(Modality.VIDEO)
     profile = CapabilityProfile(
-        tasks=frozenset({ModelTask.GENERATION}) if is_qwen35 or has_vision else frozenset(),
-        input_modalities=frozenset(input_modalities) if is_qwen35 or has_vision else frozenset(),
-        output_modalities=frozenset({Modality.TEXT}) if is_qwen35 or has_vision else frozenset(),
+        tasks=frozenset({ModelTask.GENERATION})
+        if is_qwen35 or is_qwen38_flash_next or is_deepseek41_flash or has_vision
+        else frozenset(),
+        input_modalities=frozenset(input_modalities)
+        if is_qwen35 or is_qwen38_flash_next or is_deepseek41_flash or has_vision
+        else frozenset(),
+        output_modalities=frozenset({Modality.TEXT})
+        if is_qwen35 or is_qwen38_flash_next or is_deepseek41_flash or has_vision
+        else frozenset(),
         structures=frozenset(
             ({ModelStructure.HYBRID_ATTENTION} if is_qwen35 else set())
             | ({ModelStructure.MOE} if is_moe else set())
@@ -989,12 +1224,18 @@ def describe_model(model_dir: str | Path) -> ModelDescriptor:
         DetectionEvidence(
             "architecture", architecture, "config.json:architectures[0]"
         ),
+        DetectionEvidence(
+            "repository_id",
+            repository_id,
+            ".minimlx-repo-id or checkpoint directory name",
+        ),
     ]
     if has_vision:
         evidence.append(
             DetectionEvidence("vision", "present", "config.json:vision_subconfig")
         )
     components = _describe_components(path, config)
+    component_kinds = {component.kind for component in components if component.present}
     return ModelDescriptor(
         model_dir=str(path),
         model_type=model_type,
@@ -1002,6 +1243,7 @@ def describe_model(model_dir: str | Path) -> ModelDescriptor:
         tokenizer_family="qwen" if "qwen" in model_type.lower() else "huggingface",
         capabilities=frozenset(capabilities),
         metadata={
+            "repository_id": repository_id,
             "has_vision": has_vision,
             "has_video": has_video,
             "has_audio": bool(config.get("audio_config") or config.get("audio")),
@@ -1033,6 +1275,12 @@ def describe_model(model_dir: str | Path) -> ModelDescriptor:
                 "shared_expert_intermediate_size",
                 config.get("shared_expert_intermediate_size"),
             ),
+            "is_qwen38_flash_next": is_qwen38_flash_next,
+            "is_deepseek41_flash": is_deepseek41_flash,
+            "has_engram": ComponentKind.ENGRAM_TABLE in component_kinds,
+            "has_sparse_indexer": ComponentKind.SPARSE_INDEXER in component_kinds,
+            "has_dspark": ComponentKind.DRAFT_WEIGHTS in component_kinds,
+            "total_weight_bytes": _checkpoint_weight_bytes(path),
         },
         support=profile,
         components=components,
@@ -1114,8 +1362,20 @@ def _describe_components(path: Path, config: dict) -> tuple:
         )
         names = " ".join(tensor_names)
         roles: list[ComponentKind] = []
-        if declared_draft_artifact or "mtp" in filename.lower() or "draft" in filename.lower() or any(
-            token in names for token in ("mtp.", "mtp_", "drafter.", "draft.")
+        filename_lower = filename.lower()
+        if "engram" in filename_lower or "ngram" in filename_lower:
+            roles.append(ComponentKind.ENGRAM_TABLE)
+        if "indexer" in filename_lower or "sparse_attention" in filename_lower:
+            roles.append(ComponentKind.SPARSE_INDEXER)
+        if (
+            declared_draft_artifact
+            or "mtp" in filename_lower
+            or "draft" in filename_lower
+            or "dspark" in filename_lower
+            or any(
+                token in names
+                for token in ("mtp.", "mtp_", "drafter.", "draft.")
+            )
         ):
             roles.append(ComponentKind.DRAFT_WEIGHTS)
         if any(
@@ -1177,6 +1437,23 @@ def _describe_components(path: Path, config: dict) -> tuple:
     return tuple(components)
 
 
+def _checkpoint_weight_bytes(path: Path) -> int:
+    """Return the on-disk weight size without opening tensors.
+
+    The value is an accounting hint for offload admission, not an estimate of
+    peak runtime memory.  Ignore unrelated files and tolerate incomplete
+    downloads so discovery remains useful for model-management screens.
+    """
+    total = 0
+    for pattern in ("*.safetensors", "*.bin", "*.gguf"):
+        for weight_path in path.glob(pattern):
+            try:
+                total += weight_path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
 class ModelRegistry:
     def __init__(self, adapters: list[ModelAdapter] | None = None) -> None:
         self.adapters = adapters or []
@@ -1212,5 +1489,17 @@ class ModelRegistry:
         if instance.name != prototype.name or not instance.can_load(descriptor):
             raise RuntimeError(
                 f"factory for {prototype.name!r} returned an incompatible adapter instance"
+            )
+        return instance
+
+    def create_named(self, adapter_name: str, descriptor: ModelDescriptor) -> ModelAdapter:
+        """Create the loader selected by an already-resolved execution plan."""
+        factory = self._factories.get(adapter_name)
+        if factory is None:
+            raise ValueError(f"no model adapter factory is registered as {adapter_name!r}")
+        instance = factory()
+        if instance.name != adapter_name or not instance.can_load(descriptor):
+            raise RuntimeError(
+                f"adapter factory {adapter_name!r} cannot load this checkpoint"
             )
         return instance

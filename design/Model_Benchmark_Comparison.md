@@ -33,6 +33,8 @@ MiniMLX 和 oMLX 的原始指标，不用单一吞吐量替代 TTFT、TPOT 和�
 | Qwen3.5-4B | BF16 | PASS | 已测 | 已测 | 已测 | 已测 | 当前数据 MiniMLX TTFT/TPOT/E2E 更快；需留意 oMLX 批处理设置 |
 | Qwen3.5-9B | MLX affine Q4, group 64 | PASS | 已测 | 已测 | 已测 | 已测 | MiniMLX-only 三次中位数；1K/16K 提前 EOS，硬件信息待确认 |
 | Qwen3.5-27B | MLX affine Q4, group 64 | PASS | 已测 | 已测 | 已测 | 已测 | 已记录 MiniMLX 五次中位数与用户提供的 oMLX 截图；对照条件未完全对齐 |
+| Llama 3.2 3B Instruct | MLX affine Q4, group 64 | PASS | 已测 | 已测 | 已测 | 已测 | oMLX 单请求时延在 4K/8K/16K 较低；MiniMLX 1K TTFT 较低；批处理 TPS 未对齐 |
+| Mistral Nemo Instruct 2407 | MLX affine Q4, group 64 | PASS | 已测 | 已测 | 已测 | 已测 | MiniMLX 通用 MLX-LM 基线，未与 oMLX 对照 |
 
 ## Qwen3.5-0.8B-MLX-4bit
 
@@ -382,3 +384,110 @@ MiniMLX 完成单次 1K/4K/8K/16K 测量，表面上全项优于截图所列 oML
 
 <兼容性结论、性能结论、是否进入专项优化>
 ```
+
+## Llama 3.2 3B Instruct MLX 4-bit
+
+测试设备为同一台 MacBook Pro M5 Pro、64 GB。MiniMLX 使用
+`mlx-community/Llama-3.2-3B-Instruct-4bit` 的本地副本；OMLX 使用刚复制到
+`~/.omlx/models/mlx-community/Llama-3.2-3B-Instruct-4bit` 的副本。两边截图/运行
+均为 Python 代码语料、1K/4K/8K/16K contexts、32-token quick warm-up 和 128-token
+生成。MiniMLX 为五次中位数；用户提供的 OMLX 截图标记“试验：4”，但其聚合统计方式
+未显示，故这些数字是同机参考对照，不是严格同统计口径的胜负结论。
+
+| Context | Mini TTFT ms | OMLX TTFT ms | Mini TPOT ms | OMLX TPOT ms | Mini PP TPS | OMLX PP TPS | Mini TG TPS | OMLX TG TPS | Mini E2E s | OMLX E2E s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 259.9 | 319.1 | 8.88 | 7.9 | 3940.3 | 3209.2 | 113.52 | 127.9 | 1.692 | 1.3 |
+| 4K | 1083.2 | 1043.5 | 10.42 | 9.3 | 3781.2 | 3925.1 | 96.74 | 108.8 | 2.709 | 2.2 |
+| 8K | 2289.6 | 2109.1 | 11.29 | 11.2 | 3577.9 | 3884.2 | 89.31 | 89.9 | 3.988 | 3.5 |
+| 16K | 5998.9 | 4985.7 | 16.63 | 14.9 | 2731.2 | 3286.2 | 60.62 | 67.8 | 8.395 | 6.9 |
+
+### 结论
+
+- **TTFT / prefill：** MiniMLX 在 1K 快约 18.6%；OMLX 在 4K、8K、16K 分别快约
+  3.8%、8.6%、20.3%。16K 的差距最明显。
+- **TPOT / decode：** OMLX 四个 context 的 TPOT 均较低；差距在 1K、4K、8K、16K
+  分别约为 12.4%、12.0%、0.8%、11.6%。8K 基本持平。
+- **PP/TG TPS：** PP TPS 两边交错：MiniMLX 1K 较高，OMLX 4K/8K/16K 较高。单请求
+  TG TPS OMLX 略高，8K 基本持平。
+- **E2E：** 按截图显示的一位小数，OMLX 四档均较短；由于 OMLX 只显示到 0.1 秒且
+  重复统计未说明，差距只作方向性参考。
+- **内存：** OMLX 截图显示 2.46/2.75/3.19/3.90 GB；MiniMLX 显示
+  2.460/2.691/3.181/3.986 GiB。数值接近，但单位标签/换算方式不一致，不能据此
+  宣称精确内存胜负。
+- **连续批处理吞吐：** OMLX 页面描述该 TPS 为 continuous batching，并选择 batch
+  size 2 和 4；MiniMLX 本次报告是单请求自回归矩阵，没有同配置的 continuous
+  batching 结果。截图的吞吐量 868.0/1896.7/2350.6/2400.3 不与 MiniMLX TG TPS
+  或由单请求 E2E 算出的速率直接比较。
+
+整体看，当前数据表明 MiniMLX 在 1K prefill 有优势；4K 以上 OMLX 的 prefill、decode
+和 E2E 更好，尤其 16K。**Llama 暂时保持通用 MLX-LM 基线，不据此直接新增 Llama
+优化层。** 先确认两边的重复统计、采样和吞吐口径后再做严格结论；若要对比连续批处理，
+需要 MiniMLX 也跑 batch size 2/4 的同协议测试。
+
+来源：MiniMLX 五次 context matrix 见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md)
+的 Llama 记录；oMLX 指标来自用户提供的吞吐量基准截图，试验次数标注为 4。
+
+### Llama 性能专项复测（2026-10-25）
+
+为评估此次优化候选，在 M5 Pro 64 GB 上按相同 MiniMLX 路径重建了 step=1024 的五次
+中位数基线。所有请求实际生成 128 tokens；使用标准 `mlx-lm`、Q4 affine/group64，关闭
+KV 量化，未启用 Qwen 专属优化。
+
+| Context | TTFT | TPOT | PP TPS | TG TPS | E2E | Peak MLX memory |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 236.0 ms | 7.92 ms | 4,339.0 | 127.25 | 1,513.9 ms | 2.460 GiB |
+| 4K | 982.7 ms | 9.44 ms | 4,167.9 | 106.82 | 2,455.6 ms | 2.691 GiB |
+| 8K | 2,180.4 ms | 11.23 ms | 3,757.2 | 89.77 | 3,885.6 ms | 3.181 GiB |
+| 16K | 5,645.8 ms | 14.84 ms | 2,902.0 | 67.91 | 7,811.4 ms | 3.986 GiB |
+
+与上方 oMLX 截图对照，当前 MiniMLX 在 1K/4K 的 TTFT 更低，8K 接近，16K 仍较高；
+四档 TPOT 基本相当。oMLX 的重复统计、实际 prefill step 和环境负载不可见，故该对照
+仅供定位方向，不能视作同条件胜负。此次记录替代旧 MiniMLX 样本用于后续优化决策，旧值
+保留为历史基准。
+
+另外对 1024/2048 prefill step 做了平衡顺序五次 A/B。4K 下 2048 的 TTFT/E2E 中位数
+分别改善 2.43%/1.21%；8K 改善 2.61%/1.35%；token 输出完全一致。16K 没有稳定改善。
+应用标准生成默认 step 已为 2048，因此无需新增 Llama 叠加实现。显式 step=2048 的另一轮
+整套矩阵出现显著异常慢速与离散样本，该轮不作为有效基线。
+
+Q4 MLP BF16 预解量化和 gate/up 融合 A/B 结果及不纳入生产路径的原因见
+[`Optimization_Roadmap.md`](Optimization_Roadmap.md) 的 Llama 专项记录。
+
+## Mistral Nemo Instruct 2407 MLX 4-bit（MiniMLX）
+
+- Checkpoint：`mlx-community/Mistral-Nemo-Instruct-2407-4bit`；通用 `StandardTextAdapter` / `mlx-lm-standard-runtime`，未启用模型专属优化。
+- 环境：Apple M5 Pro、64 GB unified memory；通过交互式 macOS Metal 会话运行。
+- 协议：代码语料，warm-up 32 tokens，输出上限 128，五次中位数，prefill step 1024，EOS 开启；所有样本均生成 128/128 tokens。
+- 运行配置：Q4 native prefill、native FA256 开启；Q4 dense prefill 与 Q4 MLP fusion 关闭；KV cache 未量化；autoregressive decode。套件峰值内存 9.469 GiB。
+- Tokenizer：启用 `fix_mistral_regex=True`，修复该 checkpoint 已知的正则兼容问题。
+
+| Context | TTFT median (ms) | TPOT median (ms) | PP TPS median | TG TPS median | Generated | E2E median (ms) | Peak MLX memory |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 1,253.0 | 38.42 | 817.3 | 26.23 | 128/128 | 6,442.1 | 7.290 GiB |
+| 4K | 5,222.1 | 41.58 | 784.4 | 24.24 | 128/128 | 10,830.7 | 7.592 GiB |
+| 8K | 10,885.2 | 45.34 | 752.6 | 22.23 | 128/128 | 16,965.1 | 8.264 GiB |
+| 16K | 24,561.7 | 53.60 | 667.1 | 18.80 | 128/128 | 31,706.4 | 9.469 GiB |
+
+五次原始样本（每项顺序 TTFT ms / TPOT ms / PP TPS / TG TPS / E2E ms）：
+
+- 1K：`1248.1/38.42/820.5/26.23/6456.2`；`1253.0/38.27/817.3/26.34/6424.9`；`1254.0/38.35/816.6/26.28/6442.1`；`1256.7/38.48/814.8/26.19/6476.1`；`1245.3/38.43/822.3/26.23/6438.4`。
+- 4K：`5064.0/41.65/808.9/24.20/10663.0`；`5232.6/41.51/782.8/24.28/10830.7`；`5272.2/41.58/776.9/24.24/10885.1`；`5222.1/41.69/784.4/24.17/10846.9`；`5197.5/41.43/788.1/24.33/10782.6`。
+- 8K：`10957.6/45.51/747.6/22.15/17059.8`；`10885.2/45.31/752.6/22.24/16965.1`；`10872.6/45.34/753.5/22.23/16957.7`；`10867.1/45.34/753.8/22.23/16955.2`；`10930.2/45.39/749.5/22.20/17022.1`。
+- 16K：`24347.7/53.32/672.9/18.90/31440.4`；`24468.9/53.40/669.6/18.87/31584.6`；`24568.6/53.60/666.9/18.80/31706.4`；`24561.7/53.64/667.1/18.79/31715.4`；`24699.3/53.61/663.3/18.80/31840.0`。
+
+短测通过，精确输出 `Mistral test passed`（6 tokens）。结果支持将该 checkpoint 归入通用 MLX-LM 基线的已测文本模型。尚无相同 checkpoint 的 oMLX 对照，因此此处不作跨运行时速度结论。详细兼容性记录见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md) 的 Mistral Nemo 条目。
+
+命令：`PYTHONPATH=python .venv/bin/python tools/benchmark_context_matrix.py <model-dir> Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128 --repeats 5 --step 1024 --contexts 1024 4096 8192 16384`。
+
+### Mistral 单次复测（对照 oMLX 截图）
+
+按要求每档只测一次，仍使用 32-token warm-up、128-token 输出、step 1024、代码语料，EOS 开启；每档生成均为 128/128。下表 MiniMLX 为本次单次结果，oMLX 为用户截图中标注“试验：4”的结果，重复统计方式不明，差异仅作参考。
+
+| Context | TTFT Mini / oMLX (ms) | TPOT Mini / oMLX (ms) | PP TPS Mini / oMLX | TG TPS Mini / oMLX | E2E Mini / oMLX (s) |
+|---:|---:|---:|---:|---:|---:|
+| 1K | 1,085 / 881.3 | 32.09 / 24.9 | 943.8 / 1,161.9 | 31.41 / 40.4 | 5.44 / 4.1 |
+| 4K | 4,358 / 3,484.9 | 34.59 / 27.0 | 939.8 / 1,175.4 | 29.14 / 37.3 | 9.03 / 6.9 |
+| 8K | 9,152 / 7,281.6 | 37.85 / 29.8 | 895.1 / 1,125.0 | 26.63 / 33.8 | 14.25 / 11.1 |
+| 16K | 21,344 / 16,276.7 | 44.60 / 35.1 | 767.6 / 1,006.6 | 22.60 / 28.7 | 27.30 / 20.7 |
+
+此单次复测中 MiniMLX 的 E2E 比截图 oMLX 高约 28%–33%，低于此前五次中位数对照所得约 53%–57% 的差距；单样本波动明显改变结论幅度，因此不能把先前差距视作稳定性能差距。后续需统一两边的单次/重复统计和 warm-up 后再下优化结论。MiniMLX 原始单次结果：`/tmp/minimlx-mistral-single-bench.log`。

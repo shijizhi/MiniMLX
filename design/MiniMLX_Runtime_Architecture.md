@@ -51,11 +51,13 @@ Python Runtime Service
             +-- Cache Manager
             +-- Kernel Registry
             v
-Model Adapter
+Execution Plan
             |
-            +-- Generic MLX-LM Adapter
-            +-- Qwen3.5 Adapter
-            +-- Future model-family adapters
+            +-- Generic baseline (MLX-LM / MLX-VLM)
+            |       |
+            |       +-- Optional, composable optimization providers
+            |               (version-scoped kernels / cache / prefill / decode)
+            +-- Family adapter only for a demonstrated structural/correctness gap
             v
 MLX Python / custom Metal kernels
 ```
@@ -73,17 +75,30 @@ ModelDescriptor(
 )
 ```
 
-识别顺序：
+发现器读取 `config.json`、quantization、layer types、MTP 和多模态元数据；Resolver
+根据请求和可用 provider 构造执行计划。普通文本模型默认使用通用 MLX-LM 基线，
+多模态模型按已验证的请求能力选择通用 MLX-VLM 等基线。未知或不安全的 remote code
+默认拒绝，除非用户明确允许。
 
-1. 读取 `config.json`；
-2. 读取 quantization、layer types、MTP 和 multimodal 元数据；
-3. 选择显式注册的 ModelAdapter；
-4. 没有专用 adapter 时回退到 `mlx-lm`；
-5. 对未知或不安全的 remote code 默认拒绝，除非用户明确允许。
+### 2. 通用基线与可选性能叠加
 
-### 2. Model Adapter
+所有普通文本模型先由通用 MLX-LM 基线提供加载、生成、采样和生命周期能力。没有
+专属优化的模型始终使用该路径。Qwen3.5 等专项性能优化不能取代这一基线，而应在
+基线上复用加载模型、tokenizer、processor、请求协议和生命周期，只把有明确指标与
+方法的特殊执行步骤做成可选叠加。叠加按精确模型版本与适用条件门控；不适用或
+自动启用的优化失败时回到同一模型的基线；用户显式要求的优化失败则报告错误。
 
-每个模型族由显式 adapter 提供，而不是修改 `mlx_lm` 的全局类：
+Qwen3.5 与 Qwen3.8 的优化身份必须分开。Llama 默认只走通用 MLX-LM 基线。当前
+`Qwen35Adapter` 是版本专用协调入口：它持有独立 MLX-LM/MLX-VLM 基线实例，并负责
+模型加载/卸载、版本匹配与 MTP/DFlash 路由。`qwen35_overlay.py` 负责把性能层接到
+基线；`qwen35_optimization.py` 持有 Qwen3.5 专用 hooks、自定义生成和 profiling 算法。
+优化层通过 host 引用访问基线状态，不拥有权重和模型生命周期。
+
+### 3. Family Adapter（仅结构差异需要时）
+
+只有当标准后端无法正确处理真实的结构差异时，才由 family adapter 提供适配；它与
+性能优化层概念不同。性能优化不应以完整 family adapter 的形式复制基线路径。避免
+修改 `mlx_lm` 的全局类：
 
 ```python
 class ModelAdapter(Protocol):
@@ -94,15 +109,9 @@ class ModelAdapter(Protocol):
     def capabilities(self) -> Capabilities: ...
 ```
 
-每个 adapter 内部可以有三种路径：
-
-```text
-generic      -> mlx-lm 原生实现
-optimized    -> 本项目显式实现的模型执行路径
-fallback     -> 兼容性较低或不支持优化时的安全路径
-```
-
-这样 `Qwen3.5` 的特殊逻辑只存在于 `Qwen35Adapter`，不会污染其他模型。
+Family adapter 只表达真实的结构或正确性差异；性能优化通过独立的 optimization
+provider 叠加到通用基线上。不得在 family adapter 里把基线、优化、回退揉成互斥的
+“三种模式”，也不得仅因模型名称不同新增模型专属 adapter。
 
 ### 3. Execution Plan
 

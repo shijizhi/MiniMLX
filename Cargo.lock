@@ -2253,8 +2253,6 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "461e0a334272e43ecc58a0abcb8e1c89b4a2f467990ab8993aa1934543da70ac"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3446,12 +3444,14 @@ dependencies = [
 name = "minimlx-gpui"
 version = "0.1.0"
 dependencies = [
+ "cocoa 0.26.0",
  "gpui",
  "gpui-component",
  "libc",
  "minimlx-api",
  "minimlx-protocol",
  "minimlx-supervisor",
+ "objc",
  "reqwest",
  "serde",
  "serde_json",

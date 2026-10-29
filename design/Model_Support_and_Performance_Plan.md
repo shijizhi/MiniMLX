@@ -85,6 +85,11 @@ MoE 先完成 descriptor/load/短生成和内存分类，再决定是否值得�
 
 ### 阶段 6：模型特异化性能分支
 
+本阶段的“分支”指叠加在已正确通用基线之上的可选优化层，不是替代基线的完整模型
+adapter。基线始终保留为默认兼容路径、正确性参照和回退。优化只覆盖已定位的瓶颈，
+并需按准确模型版本、硬件、shape 和依赖范围声明门控；Qwen3.5 与 Qwen3.8 分别
+立项、分别验证，Llama 默认保持在通用 MLX-LM 基线。
+
 只有阶段 2～4 的同协议结果触发以下条件时才进入：
 
 | 步骤 | 操作 | 产物 | 退出条件 |
@@ -251,12 +256,13 @@ MTP 也分两级：
 
 ### A1. 先做通用基线，再做模型族适配
 
-运行时优先采用“通用 mlx-lm 基线 + 小型模型族 adapter”的结构：
+模型执行固定采用“通用后端基线 + 可选、可组合的性能优化层”两层结构：
 
-- 通用路径负责 tokenizer、权重加载、标准量化、cache、prefill/decode 和结果协议。
-- adapter 只处理模型族确实不同的输入输出布局、cache 结构、特殊 attention 或 generation 约定。
-- 特殊性能路径必须由 capability/shape/precision 明确触发，不能由模型目录名或单一模型硬编码触发。
-- 每个特殊路径都必须保留通用 fallback，并通过同一组正确性测试。
+- 基线负责 tokenizer、权重加载、标准量化、cache、prefill/decode 和结果协议；所有没有专项优化的模型直接走该基线。
+- family adapter 只解决通用后端无法正确执行的真实结构/正确性差异，不能替代基线或充当性能优化层。
+- 优化层必须有基线测量、明确瓶颈与方法、目标指标、精确版本/形状门控和可重复正确性对照；只覆盖必要热路径，其余复用基线。
+- 每个优化层必须保留同一模型的通用基线。自动优化失败回退基线；用户显式请求优化时失败则明确报错。
+- Qwen3.5、Qwen3.8 和 Llama 的专项优化身份相互隔离；没有独立证据的模型使用通用基线。
 
 这与 oMLX 的公开结构方向一致：它把“mlx-lm 可运行模型”作为基础范围，再对具体模型族增加加载和性能 dispatch；我们实现自己的 adapter 和 kernel，不复制其代码或实现细节。[oMLX README](https://github.com/jundot/omlx/blob/main/README.md)、[oMLX model loading dispatch](https://github.com/jundot/omlx/blob/main/omlx/utils/model_loading.py)
 
@@ -329,6 +335,8 @@ MTP 也分两级：
 - [x] 横向扩展首项 `mlx-community/Qwen2.5-0.5B-Instruct-4bit`：该 checkpoint 的 Qwen2 adapter route/load/固定 prompt 生成通过；1K/4K/16K context matrix 五次重复通过。逐模型数据见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md)；此记录不外推到其他 Qwen2 checkpoint。
 - [x] `mlx-community/Qwen2.5-7B-Instruct-4bit`：两次固定 prompt token 一致；Qwen2 adapter route/load/smoke 通过；1K/4K/16K 五次重复均生成 128/128 token；32,767 prompt + 1 token 的 32K 边界检查通过。峰值 MLX 内存 5.483/6.297 GiB；设备、依赖版本和原始重复数据见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md)。
 - [x] `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit`：descriptor、Qwen2 route/load、两次固定 prompt 和代码生成 smoke 通过；项目内固定代码题 pass@1 为 8/8（28/28 断言），MiniMLX 与原生 `mlx-lm` 在这 8 题上的 prompt/generation token 全部一致（两者共用 `mlx-lm`，属于包装层回归，不是独立质量分）；1K/4K/8K/16K 五次矩阵完成，4K/16K EOS 提前结束（中位数 69/67 tokens），32K 边界检查通过。数据和范围限制见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md)。
+- [x] 横向扩展 Llama：`mlx-community/Llama-3.2-3B-Instruct-4bit` 两次重复 greedy 输出 token 一致；通用 `mlx-lm-standard` 基线通过 1K/4K/8K/16K 五次矩阵和 32K 边界检查，suite peak 5.726 GiB。设备、依赖、原始重复数据见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md)。
+- [x] 横向扩展 Gemma：`mlx-community/gemma-4-12B-it-4bit` 两次文本 greedy 输出 token 一致；通用 `mlx-vlm-generation` 基线通过 1K/4K/8K/16K 五次矩阵，所有请求生成 128/128 tokens，suite peak 8.442 GiB。该 checkpoint 含 vision/audio 部件，本轮只验证文本生成；详情见 [`Model_Support_Matrix.md`](Model_Support_Matrix.md)。
 - [ ] 对每个新模型完成 MiniMLX 自有重复基准报告；只有触发 B0 才暂停覆盖工作进入专项优化。
 
 Qwen3.5 MTP 已在统一执行框架迁移后完成同目标 AR token 对齐及强制拒绝/EOS 边界验收。MTP 保持 opt-in，AR 仍为默认路径。MoE 的 smoke/context 验证已收口。MTP 性能配对仅有单次样本，不作稳定结论；后续性能工作按本计划生成 MiniMLX 自有重复报告。

@@ -50,25 +50,31 @@ class Runtime:
     """Long-lived model runtime used by the future Rust supervisor."""
 
     def __init__(self) -> None:
-        from .adapters import MLXVLMAdapter, Qwen2Adapter, Qwen35Adapter
+        from .adapters import MLXVLMAdapter, Qwen35Adapter
+        from .adapters.deepseek41 import DeepSeek41Adapter
+        from .adapters.mlx_lm_standard import StandardTextAdapter
 
         qwen35 = Qwen35Adapter()
         mlx_vlm = MLXVLMAdapter()
-        qwen2 = Qwen2Adapter()
-        self.registry = ModelRegistry([qwen35, mlx_vlm, qwen2])
+        deepseek41 = DeepSeek41Adapter()
+        standard_text = StandardTextAdapter()
+        self.registry = ModelRegistry([qwen35, mlx_vlm, deepseek41, standard_text])
         self.adapters = {qwen35.name: qwen35}
         self.backend_adapters = {
             "qwen35-runtime": qwen35,
             "mlx-vlm-runtime": mlx_vlm,
-            "qwen2-runtime": qwen2,
+            "deepseek41-mlx-vlm-runtime": deepseek41,
+            "mlx-lm-standard-runtime": standard_text,
         }
-        # The text and VLM providers share one family implementation and one
-        # loaded model instance; the provider names remain distinct so the
-        # resolver can enforce VLM-specific dependencies and components.
-        self.family_provider_aliases = {
-            qwen35.name: frozenset({qwen35.name, "qwen35-vlm"}),
-            mlx_vlm.name: frozenset({mlx_vlm.name, "mlx-vlm-generation"}),
-            qwen2.name: frozenset({qwen2.name}),
+        # The resolved plan selects the concrete loader. This lets the same
+        # config architecture use a generic backend for one checkpoint identity
+        # and a version-scoped specialization for another.
+        self.provider_adapter_factories = {
+            qwen35.name: qwen35.name,
+            "qwen35-vlm": qwen35.name,
+            "mlx-vlm-generation": mlx_vlm.name,
+            "deepseek41-mlx-vlm": deepseek41.name,
+            standard_text.name: standard_text.name,
         }
         self.component_loaders = {
             "qwen35-tokenizer-component": lambda adapter, _descriptor, _plan: adapter.tokenizer,
@@ -77,8 +83,9 @@ class Runtime:
             "qwen35-vision-encoder-component": lambda adapter, _descriptor, _plan: adapter.model,
             "qwen35-mtp-draft-component": lambda adapter, _descriptor, _plan: adapter._mtp_draft_model,
             "qwen35-dflash-draft-component": lambda adapter, _descriptor, _plan: adapter._dflash_draft_model,
-            "qwen2-tokenizer-component": lambda adapter, _descriptor, _plan: adapter.tokenizer,
-            "qwen2-text-weights-component": lambda adapter, _descriptor, _plan: adapter.model,
+            "dflash-draft-component": lambda adapter, _descriptor, _plan: adapter._dflash_draft_model,
+            "mlx-lm-tokenizer-component": lambda adapter, _descriptor, _plan: adapter.tokenizer,
+            "mlx-lm-text-weights-component": lambda adapter, _descriptor, _plan: adapter.model,
             "mlx-vlm-tokenizer-component": lambda adapter, _descriptor, _plan: adapter.tokenizer,
             "mlx-vlm-text-weights-component": lambda adapter, _descriptor, _plan: adapter.model,
             "mlx-vlm-processor-component": lambda adapter, _descriptor, _plan: adapter.processor,
@@ -87,7 +94,7 @@ class Runtime:
         self.task_executors = {
             "qwen35-mlx-lm": self._execute_generation,
             "qwen35-vlm": self._execute_generation,
-            "qwen2-mlx-lm": self._execute_generation,
+            "mlx-lm-standard": self._execute_generation,
             "mlx-vlm-generation": self._execute_generation,
         }
         self.providers = builtin_provider_registry()
@@ -156,9 +163,33 @@ class Runtime:
                     # A configured path is not an available acceleration unless
                     # its model descriptor and complete weight manifest parse.
                     pass
+        qwen35_overlay_flags = (
+            "MINIMLX_GDN_DECODE_FUSED_CONV_SILU",
+            "MINIMLX_GDN_DECODE_CUSTOM_RECURRENCE",
+            "MINIMLX_GDN_DECODE_FUSED_QK_NORM",
+            "MINIMLX_ENABLE_Q4_NATIVE_PREFILL",
+            "MINIMLX_FULL_ATTENTION_PREFILL_FORCE_FUSED",
+            "MINIMLX_FULL_ATTENTION_DECODE_FORCE_FUSED",
+            "MINIMLX_ENABLE_ANE",
+            "MINIMLX_ENABLE_PREFIX_CACHE",
+            "MINIMLX_GREEDY_SKIP_LOGSUMEXP",
+        )
+        explicit_qwen35_overlay = any(
+            os.environ.get(name) == "1" for name in qwen35_overlay_flags
+        )
         return RuntimeEnvironment(
             backends=frozenset(backends),
             backend_versions=versions,
+            disabled_optimizations=(
+                frozenset({"qwen35-performance-overlay"})
+                if os.environ.get("MINIMLX_DISABLE_QWEN35_PERFORMANCE") == "1"
+                else frozenset()
+            ),
+            explicit_optimizations=(
+                frozenset({"qwen35-performance-overlay"})
+                if explicit_qwen35_overlay
+                else frozenset()
+            ),
             accelerations=frozenset(
                 acceleration
                 for acceleration, path in (
@@ -187,7 +218,6 @@ class Runtime:
 
     def load(self, model_dir: str | Path) -> None:
         descriptor = describe_model(model_dir)
-        loader = self.registry.resolve(descriptor)
         request = InferenceRequest(
             task=ModelTask.GENERATION,
             messages=(
@@ -214,19 +244,26 @@ class Runtime:
         decision, plan = self.resolver.resolve(descriptor, request, runtime_environment)
         if decision.status is not SupportStatus.SUPPORTED or plan is None:
             raise SupportResolutionError(decision)
-        family_provider_aliases = getattr(self, "family_provider_aliases", {})
-        if plan.family_adapter not in family_provider_aliases.get(
-            loader.name, frozenset({loader.name})
-        ):
-            raise RuntimeError(
-                "resolved family adapter does not match the registered model loader"
-            )
-        candidate = self.registry.create(descriptor)
+        def create_candidate(resolved_plan):
+            provider_factories = getattr(self, "provider_adapter_factories", None)
+            if provider_factories is None:
+                # Keep lightweight embedders and older Runtime test doubles
+                # compatible; the built-in Runtime always follows the plan.
+                return self.registry.create(descriptor)
+            adapter_factory_name = provider_factories.get(resolved_plan.family_adapter)
+            if adapter_factory_name is None:
+                raise RuntimeError(
+                    "execution plan selected an unregistered family provider: "
+                    f"{resolved_plan.family_adapter}"
+                )
+            return self.registry.create_named(adapter_factory_name, descriptor)
+
+        candidate = create_candidate(plan)
         try:
             loaded = candidate.load(descriptor, plan)
             if loaded is None:
                 raise RuntimeError(
-                    f"family adapter {loader.name!r} returned no loaded instance"
+                    f"family adapter {plan.family_adapter!r} returned no loaded instance"
                 )
         except Exception as acceleration_error:
             try:
@@ -237,20 +274,34 @@ class Runtime:
             # at load time. If one cannot initialize, resolve a fresh plan
             # with those optional components removed and retry the safe base
             # route. Explicitly requested accelerations are never downgraded.
-            if not plan.accelerations or request.accelerations:
+            explicitly_requested_overlay = bool(
+                set(plan.optimization_providers)
+                & set(runtime_environment.explicit_optimizations)
+            )
+            if explicitly_requested_overlay or (
+                not plan.accelerations and not plan.optimization_providers
+            ):
                 raise
             fallback_environment = replace(
                 runtime_environment,
-                accelerations=runtime_environment.accelerations - plan.accelerations,
+                accelerations=(
+                    runtime_environment.accelerations
+                    if request.accelerations
+                    else runtime_environment.accelerations - plan.accelerations
+                ),
+                disabled_optimizations=(
+                    runtime_environment.disabled_optimizations
+                    | frozenset(plan.optimization_providers)
+                ),
                 acceleration_components={
                     key: value
                     for key, value in runtime_environment.acceleration_components.items()
-                    if key not in plan.accelerations
+                    if request.accelerations or key not in plan.accelerations
                 },
                 acceleration_artifacts={
                     key: value
                     for key, value in runtime_environment.acceleration_artifacts.items()
-                    if key not in plan.accelerations
+                    if request.accelerations or key not in plan.accelerations
                 },
             )
             fallback_decision, fallback_plan = self.resolver.resolve(
@@ -259,21 +310,23 @@ class Runtime:
             if (
                 fallback_decision.status is not SupportStatus.SUPPORTED
                 or fallback_plan is None
-                or fallback_plan.accelerations
+                or (fallback_plan.accelerations and not request.accelerations)
+                or set(fallback_plan.optimization_providers)
+                & set(plan.optimization_providers)
             ):
                 raise RuntimeError(
-                    "optional acceleration failed to load and no unaccelerated "
-                    f"fallback plan is available: {acceleration_error}; "
+                    "optional optimization/acceleration failed to load and no "
+                    f"baseline fallback plan is available: {acceleration_error}; "
                     f"fallback resolution: {fallback_decision.reason}"
                 ) from acceleration_error
-            candidate = self.registry.create(descriptor)
+            candidate = create_candidate(fallback_plan)
             plan = fallback_plan
             runtime_environment = fallback_environment
             try:
                 loaded = candidate.load(descriptor, plan)
                 if loaded is None:
                     raise RuntimeError(
-                        f"family adapter {loader.name!r} returned no loaded instance"
+                        f"family adapter {plan.family_adapter!r} returned no loaded instance"
                     )
             except Exception as fallback_error:
                 try:
@@ -281,7 +334,7 @@ class Runtime:
                 except Exception:
                     pass
                 raise RuntimeError(
-                    "optional acceleration failed and the base backend fallback "
+                    "optional optimization/acceleration failed and the baseline fallback "
                     f"also failed: acceleration={acceleration_error}; fallback={fallback_error}"
                 ) from fallback_error
         instance = ModelInstance(descriptor=descriptor, plan=plan)
@@ -469,6 +522,8 @@ class Runtime:
                         acceleration.value: kind.value
                         for acceleration, kind in plan.acceleration_component_kinds.items()
                     },
+                    "baseline_provider": plan.baseline_provider,
+                    "optimization_providers": list(plan.optimization_providers),
                     "component_paths": {
                         kind.value: list(paths)
                         for kind, paths in plan.component_paths.items()
@@ -653,7 +708,7 @@ class Runtime:
         return executor(backend, request)
 
     def infer_stream(self, request: InferenceRequest):
-        """Stream image-generation deltas through the Python API boundary."""
+        """Stream generated deltas through the Python API boundary."""
         if not request.stream:
             raise ValueError("infer_stream requires request.stream=true")
         if request.task is not ModelTask.GENERATION:
@@ -665,15 +720,63 @@ class Runtime:
         )
         if decision.status is not SupportStatus.SUPPORTED or plan is None:
             raise SupportResolutionError(decision)
-        if not any(
+        if plan.family_adapter not in self.adapters:
+            raise RuntimeError(
+                f"execution plan family adapter {plan.family_adapter!r} is not loaded"
+            )
+        has_multimodal = any(
             part.modality in (Modality.IMAGE, Modality.VIDEO)
             for message in request.messages
             for part in message.content
-        ):
-            raise NotImplementedError("streaming text generation is not implemented")
+        )
         backend = self.backend_adapters.get(plan.backend_adapter)
-        if backend is None or backend is not self.adapter:
-            raise RuntimeError("streaming plan selected an unknown backend")
+        loaded_family = self.adapters[plan.family_adapter]
+        if backend is None:
+            raise RuntimeError(
+                "streaming execution plan references an unregistered backend: "
+                f"{plan.backend_adapter!r} (family={plan.family_adapter!r})"
+            )
+        if backend is not self.adapter or backend is not loaded_family:
+            raise RuntimeError(
+                "streaming execution plan does not match the loaded model instance: "
+                f"backend={plan.backend_adapter!r}, family={plan.family_adapter!r}"
+            )
+        self.execution_plan = plan
+        if not has_multimodal:
+            parts = [
+                part for message in request.messages for part in message.content
+                if part.modality is Modality.TEXT
+            ]
+            prompt = "\n".join(part.text or "" for part in parts)
+            format_messages = getattr(backend, "format_messages", None)
+            if callable(format_messages):
+                formatted = _call_with_optional_kwargs(
+                    format_messages,
+                    request.messages,
+                    chat_template_kwargs=request.options.get("chat_template_kwargs", {}),
+                )
+                if formatted is not None:
+                    prompt = formatted
+            stream = getattr(backend, "stream_generate", None)
+            if not callable(stream):
+                raise NotImplementedError("the selected text adapter does not support streaming")
+            yield from _call_with_optional_kwargs(
+                stream,
+                prompt,
+                int(request.options.get("max_tokens", 16)),
+                request.options.get("context_tokens"),
+                int(request.options.get("prefill_step_size", 2048)),
+                temperature=float(request.options.get("temperature", 0.0)),
+                top_p=float(request.options.get("top_p", 1.0)),
+                top_k=int(request.options.get("top_k", 0)),
+                min_p=float(request.options.get("min_p", 0.0)),
+                repetition_penalty=float(request.options.get("repetition_penalty", 1.0)),
+                presence_penalty=float(request.options.get("presence_penalty", 0.0)),
+                frequency_penalty=float(request.options.get("frequency_penalty", 0.0)),
+                max_context_tokens=request.options.get("max_context_tokens"),
+                ignore_eos=bool(request.options.get("ignore_eos", False)),
+            )
+            return
         images = [
             part
             for message in request.messages

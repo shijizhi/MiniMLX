@@ -9,11 +9,16 @@ import os
 import statistics
 import sys
 import time
+import uuid
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from minimlx_runtime.runtime import Runtime
+from minimlx_runtime.supervisor import install_parent_watchdog
+
+install_parent_watchdog()
 
 
 def apply_runtime_config(config: dict[str, object]) -> None:
@@ -51,30 +56,50 @@ def apply_runtime_config(config: dict[str, object]) -> None:
     )
 
 
-def make_omlx_aligned_prompt(tokenizer, max_context: int) -> str:
-    """Build the deterministic Python continuation prompt used by oMLX's paired benchmark."""
-    seed = (
-        "def process_batch(items):\n"
-        "    results = []\n"
-        "    for item in items:\n"
-        "        value = transform(item)\n"
-        "        results.append(value)\n"
-        "    return results\n\n"
-    )
-    source = seed * max(1000, max_context // 8)
-    token_ids = list(tokenizer.encode(source, add_special_tokens=False))
-    if len(token_ids) < max_context:
-        raise RuntimeError(
-            f"aligned prompt seed is too short: {len(token_ids)} < {max_context}"
+CORPUS_PROFILES = {
+    "code_python": ("code_python.txt", 4.0, None),
+    "code_mixed": ("code_mixed.txt", 3.5, None),
+    "novel_ko": ("novel_ko.txt", 1.35, None),
+    "novel_en": ("novel_en.txt", 4.0, "Call me Ishmael."),
+    "novel_ja": ("novel_ja.txt", 1.6, None),
+}
+
+
+def make_omlx_aligned_prompt(tokenizer, max_context: int, profile: str, corpus_dir: Path) -> list[int]:
+    """Build the exact token-ID prompt used by oMLX's corpus benchmark."""
+    filename, chars_per_token, start_marker = CORPUS_PROFILES[profile]
+    corpus = (corpus_dir / filename).read_text()
+    if start_marker:
+        marker_offset = corpus.find(start_marker)
+        if marker_offset < 0:
+            raise RuntimeError(f"benchmark corpus is missing start marker: {start_marker}")
+        corpus = corpus[marker_offset:]
+    if not corpus:
+        raise RuntimeError(f"benchmark corpus is empty: {filename}")
+
+    # Match oMLX's unique prefix and character-to-token sizing strategy. The final
+    # tokenization check keeps each prompt at the requested context length.
+    prefix = f"BENCH-{uuid.uuid4().hex} "
+    target_chars = max(round(max_context * chars_per_token), 1)
+    prompt_ids = None
+    for _ in range(16):
+        repeats = (target_chars + len(corpus) - 1) // len(corpus)
+        body = (corpus * repeats)[:target_chars]
+        token_ids = list(tokenizer.encode(prefix + body))
+        if len(token_ids) >= max_context:
+            prompt_ids = token_ids[:max_context]
+            break
+        if not token_ids:
+            raise RuntimeError(f"benchmark corpus {profile} tokenized to 0 tokens")
+        target_chars = max(
+            target_chars + 1,
+            (target_chars * max_context + len(token_ids) - 1) // len(token_ids) + 1,
         )
-    prompt = tokenizer.decode(token_ids[:max_context])
-    aligned_ids = list(tokenizer.encode(prompt, add_special_tokens=False))
-    if len(aligned_ids) != max_context:
+    if prompt_ids is None:
         raise RuntimeError(
-            "oMLX aligned prompt failed round-trip: "
-            f"expected {max_context}, got {len(aligned_ids)}"
+            f"could not build an exact {max_context}-token {profile} prompt after 16 attempts"
         )
-    return prompt
+    return prompt_ids
 
 
 def main() -> None:
@@ -100,8 +125,9 @@ def main() -> None:
     parser.add_argument(
         "--omlx-aligned-prompt",
         action="store_true",
-        help="use oMLX/PyMiniMLX's deterministic token-aligned Python prompt",
+        help="use an oMLX corpus with token-aligned prompt length",
     )
+    parser.add_argument("--context-profile", choices=CORPUS_PROFILES, default="code_python")
     parser.add_argument(
         "--text-only",
         action="store_true",
@@ -136,7 +162,7 @@ def main() -> None:
     parser.add_argument(
         "--step",
         type=int,
-        default=config.get("benchmark_prefill_step_size", 1024),
+        default=config.get("benchmark_prefill_step_size", 2048),
     )
     parser.add_argument("--contexts", nargs="+", type=int, default=[1024, 4096, 8192, 16384])
     parser.add_argument(
@@ -218,27 +244,58 @@ def main() -> None:
 
     runtime = Runtime()
     runtime.load(args.model_dir)
+    adapter = runtime.adapter
     if args.omlx_aligned_prompt:
         prompt = make_omlx_aligned_prompt(
             adapter_tokenizer := runtime.adapter.tokenizer,
             max(args.contexts),
+            args.context_profile,
+            root / "Resources/BenchmarkCorpus",
         )
         print(
-            f"prompt protocol (oMLX-aligned Python raw completion, "
+            f"prompt protocol (oMLX-aligned corpus={args.context_profile}, "
             f"max_context_tokens={max(args.contexts)})"
         )
     else:
         prompt = Path(args.prompt_file).read_text()
         print("prompt protocol (corpus file)")
+    prompt_text = adapter.tokenizer.decode(prompt) if isinstance(prompt, list) else prompt
 
-    def timed_generate(*args, **kwargs):
+    def timed_generate(prompt_tokens, **kwargs):
         start = time.perf_counter()
-        result = runtime.generate(*args, **kwargs)
+        if args.omlx_aligned_prompt and hasattr(adapter, "benchmark_generate_tokens"):
+            result = adapter.benchmark_generate_tokens(
+                prompt_tokens,
+                max_tokens=kwargs["max_tokens"],
+                prefill_step_size=kwargs["prefill_step_size"],
+            )
+        else:
+            prompt_text = (
+                prompt_tokens
+                if isinstance(prompt_tokens, str)
+                else adapter.tokenizer.decode(prompt_tokens)
+            )
+            result = runtime.generate(
+                prompt_text,
+                max_tokens=kwargs["max_tokens"],
+                context_tokens=kwargs.get("context_tokens"),
+                prefill_step_size=kwargs["prefill_step_size"],
+            )
+            result = replace(result, ttft_ms=result.prefill_ms)
         return result, (time.perf_counter() - start) * 1000.0
 
     print(
         "MiniMLX context matrix "
-        f"(warmup={args.warmup} tokens at context=2048, measured_runs={args.repeats}, step={args.step})"
+        f"(warmup_prompt={args.warmup} tokens, warmup_output=8, measured_runs={args.repeats}, step={args.step})"
+    )
+    print(
+        "metric definitions (oMLX single-request fallback) "
+        "(TTFT=request start to first generated token; "
+        "PP_TPS=prompt_tokens/TTFT when prompt_tps is unavailable; "
+        "decode interval=first to last generated-token timestamp; "
+        "TPOT=decode_interval/(completion_tokens-1); "
+        "TG_TPS=completion_tokens/decode_interval; "
+        "E2E=benchmark call wall time)"
     )
     print(
         "runtime kernels "
@@ -247,7 +304,6 @@ def main() -> None:
         f"q4_dense_disabled={config.get('disable_q4_prefill_dense', False) or os.environ.get('MINIMLX_ENABLE_Q4_NATIVE_PREFILL') == '1'}, "
         f"q4_mlp_fusion_disabled={config.get('disable_q4_mlp_fusion', False)})"
     )
-    adapter = runtime.adapter
     mtp_enabled = bool(getattr(adapter, "_mtp_enabled", False))
     dflash_enabled = bool(getattr(adapter, "_dflash_enabled", False))
     mtp_draft_path = os.environ.get("MINIMLX_MTP_DRAFT_MODEL")
@@ -293,27 +349,33 @@ def main() -> None:
         raw_eos_ids = (raw_eos_ids,)
     eos_ids = sorted(int(token) for token in raw_eos_ids)
     print(f"generation stop policy (ignore_eos={args.ignore_eos}, eos_ids={eos_ids})")
-    # Match oMLX Quick warm-up: compile/exercise one 2K-context request before
-    # timing the matrix, rather than warming every measured context separately.
-    runtime.generate(
-        prompt,
-        max_tokens=args.warmup,
-        context_tokens=2048,
-        prefill_step_size=args.step,
-    )
+    # oMLX Quick warms with a 32-token prompt and 8 generated tokens.
+    if args.omlx_aligned_prompt:
+        warmup_prompt = make_omlx_aligned_prompt(
+            adapter.tokenizer, args.warmup, args.context_profile,
+            root / "Resources/BenchmarkCorpus",
+        )
+        timed_generate(warmup_prompt, max_tokens=8, prefill_step_size=args.step)
+    else:
+        runtime.generate(
+            prompt_text,
+            max_tokens=args.warmup,
+            context_tokens=2048,
+            prefill_step_size=args.step,
+        )
     if args.mtp_verify_ab:
         # Compile both source-derived candidates before collecting measurements.
         os.environ["MINIMLX_MTP_FORCE_FUSED_VERIFY"] = "1"
         os.environ["MINIMLX_MTP_VERIFY_SDPA"] = "fused"
         runtime.generate(
-            prompt,
+            prompt_text,
             max_tokens=args.warmup,
             context_tokens=2048,
             prefill_step_size=args.step,
         )
         os.environ["MINIMLX_MTP_VERIFY_SDPA"] = "vector"
         runtime.generate(
-            prompt,
+            prompt_text,
             max_tokens=args.warmup,
             context_tokens=2048,
             prefill_step_size=args.step,
@@ -326,7 +388,7 @@ def main() -> None:
         for mode in ("batched", "singleton_batch"):
             os.environ["MINIMLX_MTP_VERIFY_ARGMAX"] = mode
             runtime.generate(
-                prompt,
+                prompt_text,
                 max_tokens=args.warmup,
                 context_tokens=2048,
                 prefill_step_size=args.step,
@@ -337,7 +399,7 @@ def main() -> None:
         # Warm the candidate with the ordinary model forward before timing.
         os.environ["MINIMLX_MTP_VERIFY_FORWARD"] = "standard"
         runtime.generate(
-            prompt,
+            prompt_text,
             max_tokens=args.warmup,
             context_tokens=2048,
             prefill_step_size=args.step,
@@ -348,7 +410,7 @@ def main() -> None:
         # Compile the optional fused GDN arm before timing, with the same
         # fused-attention and verifier settings used in both measured variants.
         os.environ["MINIMLX_MTP_GDN_PREWORK"] = "1"
-        runtime.generate(prompt, max_tokens=args.warmup, context_tokens=2048,
+        runtime.generate(prompt_text, max_tokens=args.warmup, context_tokens=2048,
                          prefill_step_size=args.step)
         os.environ["MINIMLX_MTP_GDN_PREWORK"] = "0"
 
@@ -359,6 +421,13 @@ def main() -> None:
     context_peak_memory = []
 
     for context_index, context in enumerate(args.contexts):
+        if args.omlx_aligned_prompt:
+            # oMLX builds each context length independently from the corpus.
+            prompt = make_omlx_aligned_prompt(
+                adapter.tokenizer, context, args.context_profile,
+                root / "Resources/BenchmarkCorpus",
+            )
+            prompt_text = adapter.tokenizer.decode(prompt)
         if mx is not None and hasattr(mx, "reset_peak_memory"):
             # Match oMLX's per-request memory reporting.  Keep model weights
             # resident as the baseline, but measure each context independently.
@@ -383,7 +452,7 @@ def main() -> None:
                 decode_ms = result.decode_ms
                 tpot_ms = decode_ms / (args.max_tokens - 1) if args.max_tokens > 1 else 0.0
                 print(
-                    f"context={context} gdn={mode} TTFT={result.prefill_ms:.1f} ms "
+                    f"context={context} gdn={mode} TTFT={(result.ttft_ms if result.ttft_ms is not None else result.prefill_ms):.1f} ms "
                     f"TPOT={tpot_ms:.2f} ms TG_TPS={args.max_tokens * 1000.0 / decode_ms:.2f} "
                     f"E2E={e2e_ms:.1f} ms mtp_rounds={rounds} drafted={drafted} "
                     f"accepted={accepted} gdn_routes={mtp_gdn_prework_routes()}"
@@ -415,7 +484,7 @@ def main() -> None:
                 tpot_ms = decode_ms / (args.max_tokens - 1) if args.max_tokens > 1 else 0.0
                 print(
                     f"context={context} verifier={mode} "
-                    f"TTFT={result.prefill_ms:.1f} ms "
+                    f"TTFT={(result.ttft_ms if result.ttft_ms is not None else result.prefill_ms):.1f} ms "
                     f"TPOT={tpot_ms:.2f} ms "
                     f"TG_TPS={args.max_tokens * 1000.0 / decode_ms:.2f} "
                     f"E2E={e2e_ms:.1f} ms "
@@ -474,7 +543,7 @@ def main() -> None:
                 tpot_ms = decode_ms / (args.max_tokens - 1) if args.max_tokens > 1 else 0.0
                 print(
                     f"context={context} argmax={mode} "
-                    f"TTFT={result.prefill_ms:.1f} ms "
+                    f"TTFT={(result.ttft_ms if result.ttft_ms is not None else result.prefill_ms):.1f} ms "
                     f"TPOT={tpot_ms:.2f} ms "
                     f"TG_TPS={args.max_tokens * 1000.0 / decode_ms:.2f} "
                     f"E2E={e2e_ms:.1f} ms "
@@ -619,7 +688,7 @@ def main() -> None:
                 tpot_ms = decode_ms / (args.max_tokens - 1) if args.max_tokens > 1 else 0.0
                 print(
                     f"context={context} variant={label} "
-                    f"TTFT={result.prefill_ms:.1f} ms "
+                    f"TTFT={(result.ttft_ms if result.ttft_ms is not None else result.prefill_ms):.1f} ms "
                     f"TPOT={tpot_ms:.2f} ms "
                     f"TG_TPS={args.max_tokens * 1000.0 / decode_ms:.2f} "
                     f"E2E={e2e_ms:.1f} ms "
@@ -689,7 +758,7 @@ def main() -> None:
                     f"generated={generated_tokens} max_tokens={args.max_tokens}"
                 )
             measurements.append({
-                "ttft": result.prefill_ms,
+                "ttft": result.ttft_ms if result.ttft_ms is not None else result.prefill_ms,
                 "decode": result.decode_ms,
                 "tpot": result.decode_ms / (generated_tokens - 1) if generated_tokens > 1 else 0.0,
                 "pp_tps": context * 1000.0 / result.prefill_ms if result.prefill_ms > 0 else 0.0,

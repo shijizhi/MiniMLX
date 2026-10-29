@@ -38,11 +38,57 @@ MiniMLX 的目标是覆盖 oMLX 所提供的模型任务与输入/输出模态�
 - `ModelDescriptor`：稳定身份、架构、配置摘要、量化、文件组件清单及发现证据；不承载执行器对象。
 - `CapabilityProfile`：任务集合、输入/输出模态、结构属性、可选加速及其约束。
 - `InferenceRequest`：task、带类型的消息/载荷、独立的 acceleration 集合、采样/长度选项、会话和流式选项。加速声明在 JSONL 中使用顶层 `accelerations` 字段；旧版本放在 `options.accelerations` 的请求只作为兼容输入读取，新客户端不得继续把路由语义塞入通用选项。
-- `ExecutionPlan`：解析出的 task adapter、family adapter、backend、组件绑定、加速到运行时组件 provider 的映射、执行阶段、cache/scheduler 策略和 fallback 链。
+- `ExecutionPlan`：解析出的 task/family/backend、`baseline_provider`、零个或多个 `optimization_providers`、组件绑定、加速到运行时组件 provider 的映射、执行阶段、cache/scheduler 策略和 fallback 链。
 - `InferenceResult`：按任务区分的结果（生成文本、向量、相关性分数、转写、音频块等）以及统一 usage/时延/诊断元数据。
 - `SupportDecision`：supported、unsupported、blocked_by_dependency、missing_component、ambiguous 等结构化结果，附证据和可行动解释。
 
 ## 分层架构
+
+### 模型执行的两层：通用基线与性能叠加
+
+每个模型的执行方案必须先有一个**通用基线层**，再按需叠加零个或多个
+**性能优化层**。这是模型执行架构的两层，和下面按 task/family/backend/component
+拆分的职责正交；provider 角色用于表达实现边界，不改变两层关系。
+
+```text
+请求 / 检查点 / 运行环境
+          ↓
+通用基线（默认且完整）
+MLX-LM / MLX-VLM 等受支持上游实现
+          ↓ 复用基线接口、权重与生命周期
+性能优化层（可选、可组合、可单独关闭）
+已测量的 kernel / cache / prefill / decode / batching 等专项实现
+          ↓ 不适用或未通过门控时
+回到同一模型的通用基线
+```
+
+**通用基线是所有未专项调优模型的正常执行路径，也是每个优化层的正确性
+参照和安全回退。** 新家族只要能由上游通用后端正确执行，就接入基线能力目录；
+不得为了模型名称、尺寸或量化格式复制一份模型专属 adapter。
+
+性能层只有在存在可复现的基线、明确的瓶颈指标、具体优化方法和目标场景时才可
+新增。它声明准确的模型身份/版本范围、依赖与硬件约束、适用 shape 和启用条件，
+只覆盖必要的执行点，其余加载、预处理、协议和生成语义继续复用基线。优化应通过
+显式 hook/provider/decorator 或等价组合边界接入，不能把完整基线悄悄替换成另一套
+同名模型 adapter。
+
+每个优化必须与基线做输出/状态正确性对照，并报告目标指标收益和非目标场景回归；
+任一门控不满足时关闭该优化并执行基线。用户显式要求某优化时，初始化失败应清楚
+报错，不能静默降级。优化标识、基线标识和版本约束都须出现在可检查的执行计划中。
+
+版本边界按真实架构/模型身份划分，不能把相近版本混为一个优化目标：Qwen3.5
+优化只匹配 Qwen3.5；Qwen3.8 若有自己的测量与方法，另建 Qwen3.8 优化层；Llama
+走通用 MLX-LM 基线，除非将来有证据支持独立的 Llama 优化。共享上游实现或
+`model_type` 不等于共享 MiniMLX 专项优化。
+
+当前实现已把检查点仓库身份纳入 provider 匹配：Qwen3.8 从 Qwen3.5 专用 provider
+排除，文本请求解析到通用 MLX-LM，图像/视频请求解析到通用 MLX-VLM；Runtime 按
+`ExecutionPlan` 选具体 loader。计划已记录 baseline 和 optimization provider；Qwen3.5
+普通文本/VLM加载复用独立 baseline 实例，自动启用的性能初始化失败会禁用该 overlay
+后回退；通过专项环境选项明确请求的优化失败则保留错误并直接报告。
+overlay 安装协调已移入 `adapters/qwen35_overlay.py`；专用 hook、自定义生成、视觉特征
+缓存和 profiling 算法由 `adapters/qwen35_optimization.py` 实现，并通过 overlay 组合到基线上。`Qwen35Adapter`
+保留加载/卸载、版本匹配和 MTP/DFlash acceleration 路由。
 
 ```text
 External APIs / GPUI / CLI
@@ -61,6 +107,10 @@ External APIs / GPUI / CLI
             |
        MLX / Native Kernels
 ```
+
+这张职责图与前述两层关系同时成立：解析器先选可执行的通用基线，再把符合身份和
+约束的性能 providers 叠加到计划中；family adapter 只有表达真实结构差异时才出现，
+不能充当“性能层”的替代名称。
 
 ### 1. Discovery
 
@@ -102,7 +152,7 @@ External APIs / GPUI / CLI
 
 ## Registry / plugin contract
 
-每个 provider 注册 `AdapterRegistration`：名称、角色、支持 task/modality/architecture/backend、可选 acceleration、组件/依赖/硬件约束和优先级。注册匹配即纯配置 `probe`；`CapabilityResolver` 执行 validate 并产出 `ExecutionPlan`；family loader 在 plan 通过后才加载权重。内置 provider 和未来外部 plugin 使用同一契约，外部插件明确配置启用，不默认执行任意远程模型代码。
+每个 provider 注册 `AdapterRegistration`：名称、角色（包括可选的 `OPTIMIZATION`）、支持 task/modality/architecture/backend、模型版本排除条件、可选 acceleration、组件/依赖/硬件约束和优先级。注册匹配即纯配置 `probe`；resolver 解析通用 baseline，再筛选 optimization providers 并产出 `ExecutionPlan`；Runtime 按计划加载 baseline 并叠加优化。可选优化初始化失败时移除失败优化、重新解析并加载 baseline；用户显式指定的 acceleration 不静默降级。内置 provider 和未来外部 plugin 使用同一契约，外部插件明确配置启用，不默认执行任意远程模型代码。
 
 ## 测试与支持状态
 
@@ -135,6 +185,7 @@ External APIs / GPUI / CLI
 - 对照 oMLX、LM Studio、vLLM、llama.cpp 的做法，记录选择理由、反例和 MiniMLX 决策，不把某个项目的实现照搬为约束。
 - 对照和设计取舍记录：[`Architecture_Decisions.md`](Architecture_Decisions.md)。
 - 适配器开发模板见 [`Adapter_Development_Template.md`](Adapter_Development_Template.md)，包含注册、factory/lifecycle、验证矩阵和支持状态记录合同。
+- 新模型接入的实际决策树和最小变更规范见 [`Model_Integration_Standard.md`](Model_Integration_Standard.md)。
 - 能力状态记录的机器可读 JSON Schema：[`model_support_record.schema.json`](model_support_record.schema.json)。
 - 验收：完整覆盖所有目标任务、模态和检查点组件；主要失败模式都有表述；接口关系图和决策记录完成。
 

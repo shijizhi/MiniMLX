@@ -1,12 +1,15 @@
 import json
+import socket
 import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from minimlx_runtime.api.http import (
     DEFAULT_API_MAX_TOKENS,
     _ApiTelemetry,
+    _DualStackThreadingHTTPServer,
     _anthropic_request,
     _apply_model_defaults,
     _finish_reason,
@@ -30,6 +33,27 @@ from minimlx_runtime.types import ContentPart, InferenceRequest, InputMessage, M
 
 
 class HttpApiTests(unittest.TestCase):
+    def test_default_memory_reserve_matches_omlx_aggressive_tier(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(memory_reserve_bytes(64 * GIB), GIB + GIB // 2)
+            self.assertEqual(
+                memory_reserve_bytes(128 * GIB), 2 * GIB + GIB * 56 // 100
+            )
+
+    def test_dual_stack_listener_accepts_ipv4_mapped_connections(self):
+        if not socket.has_ipv6:
+            self.skipTest("IPv6 is unavailable")
+
+        server = _DualStackThreadingHTTPServer(("::", 0), object, bind_and_activate=False)
+        try:
+            with patch.object(socket.socket, "bind", return_value=None):
+                server.server_bind()
+            self.assertEqual(server.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY), 0)
+        finally:
+            server.server_close()
+
     def test_memory_admission_refuses_only_when_system_reserve_is_breached(self):
         total = 32 * GIB
         reserve = memory_reserve_bytes(total)
@@ -82,7 +106,7 @@ class HttpApiTests(unittest.TestCase):
         total = 32 * GIB
         admission = InferenceAdmission(
             1,
-            memory_reader=lambda: MemorySnapshot(total, 7 * GIB, 25 * GIB, "test"),
+            memory_reader=lambda: MemorySnapshot(total, 4 * GIB, 28 * GIB, "test"),
             additional_reserve_bytes=context_cache,
         )
         self.assertEqual(admission.acquire().code, "memory_pressure")
@@ -359,24 +383,27 @@ class HttpApiTests(unittest.TestCase):
                 row = database.execute("SELECT model, status, prompt_tokens, completion_tokens FROM usage_history").fetchone()
             self.assertEqual(row, ("fixture", "complete", 8, 3))
 
-    def test_text_stream_uses_sse_compatible_buffered_result(self):
+    def test_text_stream_uses_incremental_runtime_events(self):
         class FakeRuntime:
-            def infer(self, request):
+            def infer_stream(self, request):
                 self.stream_flag = request.stream
-                return SimpleNamespace(
-                    payload=SimpleNamespace(text="complete response"),
-                    usage={"prompt_tokens": 4, "completion_tokens": 2},
-                    metrics={"prefill_ms": 10.0, "decode_ms": 5.0},
-                )
+                yield {"event": "delta", "delta": "first", "token_ids": [11]}
+                yield {"event": "delta", "delta": " second", "token_ids": [12]}
+                yield {
+                    "event": "done", "text": "first second",
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                    "metrics": {"prefill_ms": 10.0, "decode_ms": 5.0},
+                }
 
         runtime = FakeRuntime()
         request, events = _infer(runtime, {
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
         })
+        events = list(events)
         self.assertTrue(request.stream)
-        self.assertFalse(runtime.stream_flag)
-        self.assertEqual([event["delta"] for event in events if event["event"] == "delta"], ["complete response"])
+        self.assertTrue(runtime.stream_flag)
+        self.assertEqual([event["delta"] for event in events if event["event"] == "delta"], ["first", " second"])
 
     def test_telemetry_aggregates_counts_rates_and_recent_requests(self):
         telemetry = _ApiTelemetry()

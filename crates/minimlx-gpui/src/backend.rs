@@ -14,7 +14,12 @@ const DEFAULT_API_MAX_TOKENS: u32 = 32768;
 const DEFAULT_API_MAX_CONTEXT: u32 = 32768;
 const MODEL_FILE_REQUEST_RETRIES: usize = 5;
 const GIB: u64 = 1024 * 1024 * 1024;
-const MINIMUM_MEMORY_HEADROOM: u64 = 4 * GIB;
+// Match oMLX's aggressive memory tier: 2% of RAM, bounded to 1.5–4 GiB.
+const MINIMUM_MEMORY_HEADROOM: u64 = GIB + GIB / 2;
+const MAXIMUM_MEMORY_HEADROOM: u64 = 4 * GIB;
+const MEMORY_HEADROOM_PERCENT: u64 = 2;
+const MODEL_WEIGHT_OVERHEAD_NUMERATOR: u64 = 5;
+const MODEL_WEIGHT_OVERHEAD_DENOMINATOR: u64 = 4;
 
 #[cfg(target_os = "macos")]
 fn system_physical_memory_bytes() -> u64 {
@@ -64,6 +69,7 @@ pub struct ModelInferenceOptions {
 
 #[derive(Clone, Debug)]
 pub struct ContextBenchmarkOptions {
+    pub corpus_profile: String,
     pub contexts: Vec<usize>,
     pub warmup: usize,
     pub repeats: usize,
@@ -97,16 +103,42 @@ pub enum ModelSearchSort {
     Likes,
 }
 
-pub fn sort_model_search_results(results: &mut [ModelSearchResult], sort: ModelSearchSort) {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelSearchSortDirection {
+    Ascending,
+    #[default]
+    Descending,
+}
+
+pub fn sort_model_search_results(
+    results: &mut [ModelSearchResult],
+    sort: ModelSearchSort,
+    direction: ModelSearchSortDirection,
+) {
     results.sort_by(|left, right| {
+        let compare_optional = |left: Option<u64>, right: Option<u64>| match (left, right) {
+            (Some(left), Some(right)) => match direction {
+                ModelSearchSortDirection::Ascending => left.cmp(&right),
+                ModelSearchSortDirection::Descending => right.cmp(&left),
+            },
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
         let order = match sort {
-            ModelSearchSort::Name => left
-                .repo_id
-                .to_lowercase()
-                .cmp(&right.repo_id.to_lowercase()),
-            ModelSearchSort::Size => right.size_bytes.cmp(&left.size_bytes),
-            ModelSearchSort::Downloads => right.downloads.cmp(&left.downloads),
-            ModelSearchSort::Likes => right.likes.cmp(&left.likes),
+            ModelSearchSort::Name => {
+                let order = left
+                    .repo_id
+                    .to_lowercase()
+                    .cmp(&right.repo_id.to_lowercase());
+                match direction {
+                    ModelSearchSortDirection::Ascending => order,
+                    ModelSearchSortDirection::Descending => order.reverse(),
+                }
+            }
+            ModelSearchSort::Size => compare_optional(left.size_bytes, right.size_bytes),
+            ModelSearchSort::Downloads => compare_optional(left.downloads, right.downloads),
+            ModelSearchSort::Likes => compare_optional(left.likes, right.likes),
         };
         order.then_with(|| left.repo_id.cmp(&right.repo_id))
     });
@@ -116,6 +148,7 @@ pub fn sort_model_search_results(results: &mut [ModelSearchResult], sort: ModelS
 pub struct DownloadContext {
     download_directory: PathBuf,
     huggingface_endpoint: String,
+    modelscope_endpoint: String,
     http_proxy: String,
     https_proxy: String,
     no_proxy: String,
@@ -149,6 +182,7 @@ pub struct Backend {
     configured_auth_required: bool,
     configured_api_key: Option<String>,
     configured_huggingface_endpoint: String,
+    configured_modelscope_endpoint: String,
     configured_http_proxy: String,
     configured_https_proxy: String,
     configured_no_proxy: String,
@@ -227,6 +261,13 @@ fn modelscope_model_search_params(query: &str) -> Vec<(&'static str, &str)> {
     ]
 }
 
+fn modelscope_model_search_url(context: &DownloadContext) -> String {
+    format!(
+        "{}/openapi/v1/models",
+        context.modelscope_endpoint.trim_end_matches('/')
+    )
+}
+
 fn huggingface_repo_size(
     client: &reqwest::blocking::Client,
     context: &DownloadContext,
@@ -271,7 +312,7 @@ fn fetch_model_card(
 ) -> Result<String, String> {
     let files = match source {
         "huggingface" => list_huggingface_files(client, context, repo_id)?,
-        "modelscope" => list_modelscope_files(client, repo_id)?,
+        "modelscope" => list_modelscope_files(client, context, repo_id)?,
         _ => return Err("unsupported model hub".into()),
     };
     let readme = files
@@ -280,7 +321,7 @@ fn fetch_model_card(
         .ok_or_else(|| "model repository does not contain README.md".to_string())?;
     let url = match source {
         "huggingface" => huggingface_file_url(context, repo_id, &readme.revision, &readme.path)?,
-        "modelscope" => modelscope_file_url(repo_id, &readme.revision, &readme.path)?,
+        "modelscope" => modelscope_file_url(context, repo_id, &readme.revision, &readme.path)?,
         _ => unreachable!(),
     };
     let response = client
@@ -393,10 +434,12 @@ fn list_huggingface_files(
 
 fn list_modelscope_files(
     client: &reqwest::blocking::Client,
+    context: &DownloadContext,
     repo_id: &str,
 ) -> Result<Vec<RemoteModelFile>, String> {
     let mut url = reqwest::Url::parse(&format!(
-        "https://modelscope.cn/api/v1/models/{repo_id}/repo/files"
+        "{}/api/v1/models/{repo_id}/repo/files",
+        context.modelscope_endpoint.trim_end_matches('/')
     ))
     .map_err(|error| format!("invalid ModelScope API URL: {error}"))?;
     url.query_pairs_mut()
@@ -478,12 +521,14 @@ fn huggingface_file_url(
 }
 
 fn modelscope_file_url(
+    context: &DownloadContext,
     repo_id: &str,
     revision: &str,
     file_path: &str,
 ) -> Result<reqwest::Url, String> {
     let url = reqwest::Url::parse(&format!(
-        "https://modelscope.cn/api/v1/models/{repo_id}/repo"
+        "{}/api/v1/models/{repo_id}/repo",
+        context.modelscope_endpoint.trim_end_matches('/')
     ))
     .map_err(|error| format!("invalid ModelScope download URL: {error}"))?;
     let mut url = url;
@@ -761,6 +806,7 @@ impl Backend {
             configured_auth_required: false,
             configured_api_key: None,
             configured_huggingface_endpoint: "https://huggingface.co".into(),
+            configured_modelscope_endpoint: "https://modelscope.cn".into(),
             configured_http_proxy: String::new(),
             configured_https_proxy: String::new(),
             configured_no_proxy: String::new(),
@@ -957,6 +1003,7 @@ impl Backend {
                     .to_path_buf()
             }),
             huggingface_endpoint: self.configured_huggingface_endpoint.clone(),
+            modelscope_endpoint: self.configured_modelscope_endpoint.clone(),
             http_proxy: self.configured_http_proxy.clone(),
             https_proxy: self.configured_https_proxy.clone(),
             no_proxy: self.configured_no_proxy.clone(),
@@ -980,7 +1027,7 @@ impl Backend {
                 huggingface_model_search_params(query),
             ),
             "modelscope" => (
-                "https://modelscope.cn/openapi/v1/models".to_string(),
+                modelscope_model_search_url(context),
                 modelscope_model_search_params(query),
             ),
             _ => return Err(format!("unsupported model hub: {source}")),
@@ -1092,6 +1139,7 @@ impl Backend {
     pub fn configure_download(
         &mut self,
         huggingface_endpoint: String,
+        modelscope_endpoint: String,
         http_proxy: String,
         https_proxy: String,
         no_proxy: String,
@@ -1105,6 +1153,15 @@ impl Backend {
         let host = parsed.split(['/', '?', '#']).next().unwrap_or_default();
         if host.is_empty() || endpoint.chars().any(char::is_whitespace) {
             return Err("Enter a valid Hugging Face endpoint URL".into());
+        }
+        let modelscope_endpoint = modelscope_endpoint.trim().trim_end_matches('/');
+        let parsed = modelscope_endpoint
+            .strip_prefix("https://")
+            .or_else(|| modelscope_endpoint.strip_prefix("http://"))
+            .ok_or_else(|| "ModelScope endpoint must use http:// or https://".to_string())?;
+        let host = parsed.split(['/', '?', '#']).next().unwrap_or_default();
+        if host.is_empty() || modelscope_endpoint.chars().any(char::is_whitespace) {
+            return Err("Enter a valid ModelScope endpoint URL".into());
         }
         for (label, proxy) in [("HTTP", http_proxy.trim()), ("HTTPS", https_proxy.trim())] {
             if proxy.is_empty() {
@@ -1127,6 +1184,7 @@ impl Backend {
             }
         }
         self.configured_huggingface_endpoint = endpoint.to_string();
+        self.configured_modelscope_endpoint = modelscope_endpoint.to_string();
         self.configured_http_proxy = http_proxy.trim().to_string();
         self.configured_https_proxy = https_proxy.trim().to_string();
         self.configured_no_proxy = no_proxy.trim().to_string();
@@ -1197,10 +1255,7 @@ impl Backend {
                 Path::new(path).display()
             ));
         }
-        let max_context = model_options
-            .and_then(|options| options.max_context_tokens)
-            .unwrap_or(self.configured_max_context);
-        self.ensure_memory_budget(path, model_options, max_context)?;
+        self.ensure_memory_budget(path, model_options, None, false)?;
         // A failed health check does not mean the child process is gone. Stop
         // any tracked API child before switching to the in-process worker.
         if self.api_process.is_some() {
@@ -1286,7 +1341,7 @@ impl Backend {
         benchmark_options: &ContextBenchmarkOptions,
     ) -> Result<String, String> {
         let max_context = benchmark_options.contexts.iter().copied().max().unwrap_or(0) as u32;
-        self.ensure_memory_budget(model_path, model_options, max_context)?;
+        self.ensure_memory_budget(model_path, model_options, Some(max_context), false)?;
         let restore_api = self.api_running();
         let restore_model = self.loaded_model.clone();
         let restore_worker_options = self.last_worker_model_options.clone();
@@ -1334,7 +1389,15 @@ impl Backend {
         {
             return Err("请选择上下文长度，并确保测试参数均大于 0".into());
         }
-        let prompt = self.root.join("Resources/BenchmarkCorpus/code_python.txt");
+        let corpus_file = match benchmark_options.corpus_profile.as_str() {
+            "code_python" => "code_python.txt",
+            "code_mixed" => "code_mixed.txt",
+            "novel_ko" => "novel_ko.txt",
+            "novel_en" => "novel_en.txt",
+            "novel_ja" => "novel_ja.txt",
+            _ => return Err("请选择有效的测试语料".into()),
+        };
+        let prompt = self.root.join("Resources/BenchmarkCorpus").join(corpus_file);
         let mtp_draft_model = model_options.and_then(|options| options.mtp_draft_model.as_deref());
         let dflash_draft_model = model_options.and_then(|options| options.dflash_draft_model.as_deref());
         let mtp_report = mtp_draft_model
@@ -1353,6 +1416,7 @@ impl Backend {
         command
             .current_dir(&self.root)
             .env("PYTHONPATH", self.root.join("python"))
+            .env("MINIMLX_SUPERVISOR_PID", std::process::id().to_string())
             .arg(self.root.join("tools/benchmark_context_matrix.py"))
             .arg(model_path)
             .arg(&prompt)
@@ -1364,6 +1428,7 @@ impl Backend {
             .args(benchmark_options.contexts.iter().map(usize::to_string))
             .arg("--text-only")
             .arg("--omlx-aligned-prompt")
+            .args(["--context-profile", &benchmark_options.corpus_profile])
             .args(benchmark_options.ignore_eos.then_some("--ignore-eos"))
             .args(
                 mtp_draft_model
@@ -1473,9 +1538,10 @@ impl Backend {
         fs::write(
             &report,
             format!(
-                "# MiniMLX Context Matrix\n\n- Generated (UTC): {generated_at}\n- Model: `{model_path}`\n- Model type: `{model_type}`\n- Architecture: `{architectures}`\n- Quantization metadata: `{quantization}`\n- Model disk size: {}\n- Hardware: {chip}\n- Unified memory: {}\n- macOS: {os_version}\n- Python packages: {versions}\n- Source revision: {revision} ({changes} working tree)\n- Benchmark corpus: `{}`\n- Corpus SHA-256: `{prompt_hash}`\n- MTP draft: `{mtp_report}`\n- DFlash draft: `{dflash_report}`\n- Warm-up: {} tokens at 2K context\n- Measurement: {} run(s) per context; median and raw samples reported\n- Generation limit: {} tokens\n- Prefill step: {} tokens\n- Contexts: {:?}\n- Prompt protocol: oMLX-aligned raw completion\n- Ignore EOS: {}\n- Runtime: MiniMLX only\n\n## Raw benchmark output\n\n```text\n{stdout}\n```\n",
+                "# MiniMLX Context Matrix\n\n- Generated (UTC): {generated_at}\n- Model: `{model_path}`\n- Model type: `{model_type}`\n- Architecture: `{architectures}`\n- Quantization metadata: `{quantization}`\n- Model disk size: {}\n- Hardware: {chip}\n- Unified memory: {}\n- macOS: {os_version}\n- Python packages: {versions}\n- Source revision: {revision} ({changes} working tree)\n- Benchmark corpus profile: `{}`\n- Benchmark corpus file: `{}`\n- Corpus SHA-256: `{prompt_hash}`\n- MTP draft: `{mtp_report}`\n- DFlash draft: `{dflash_report}`\n- Warm-up: {} tokens at 2K context\n- Measurement: {} run(s) per context; median and raw samples reported\n- Generation limit: {} tokens\n- Prefill step: {} tokens\n- Contexts: {:?}\n- Prompt protocol: oMLX-aligned corpus completion\n- Ignore EOS: {}\n- Runtime: MiniMLX only\n\n## Raw benchmark output\n\n```text\n{stdout}\n```\n",
                 format_bytes(directory_size(Path::new(model_path))),
                 format_bytes(memory_total),
+                benchmark_options.corpus_profile,
                 prompt.display(),
                 benchmark_options.warmup,
                 benchmark_options.repeats,
@@ -1514,7 +1580,7 @@ impl Backend {
         let files = if source == "huggingface" {
             list_huggingface_files(&client, context, repo_id)?
         } else {
-            list_modelscope_files(&client, repo_id)?
+            list_modelscope_files(&client, context, repo_id)?
         };
         if files.is_empty() {
             return Err("model repository contains no downloadable files".into());
@@ -1531,7 +1597,7 @@ impl Backend {
             let url = if source == "huggingface" {
                 huggingface_file_url(context, repo_id, &file.revision, &file.path)?
             } else {
-                modelscope_file_url(repo_id, &file.revision, &file.path)?
+                modelscope_file_url(context, repo_id, &file.revision, &file.path)?
             };
             let downloaded = download_one_file(&client, &url, &destination, &file, &mut |_| {
                 on_progress(downloaded_bytes_for_files(&destination, &files), total_size)
@@ -1588,14 +1654,19 @@ impl Backend {
         &self,
         model_path: &str,
         model_options: Option<&ModelInferenceOptions>,
-        context_tokens: u32,
+        benchmark_context_tokens: Option<u32>,
+        replaces_loaded_model: bool,
     ) -> Result<(), String> {
         let (used, total) = self.system_memory();
         if total == 0 {
             return Ok(());
         }
 
-        let mut required = estimate_model_runtime_memory(model_path, context_tokens);
+        let estimate = |path: &str| match benchmark_context_tokens {
+            Some(context_tokens) => estimate_model_runtime_memory(path, context_tokens),
+            None => estimate_model_weight_memory(path),
+        };
+        let mut required = estimate(model_path);
         if let Some(options) = model_options {
             for draft_path in [
                 options.mtp_draft_model.as_deref(),
@@ -1604,29 +1675,44 @@ impl Backend {
             .into_iter()
             .flatten()
             {
-                required = required.saturating_add(estimate_model_runtime_memory(
-                    draft_path,
-                    context_tokens,
-                ));
+                required = required.saturating_add(estimate(draft_path));
             }
         }
 
-        // Replacing a currently loaded copy of this exact model releases its
-        // estimated footprint before the new API process starts.
-        let replacing_same_model = self
-            .loaded_model
-            .as_deref()
-            .is_some_and(|loaded| same_filesystem_path(loaded, model_path))
-            && (self.worker.is_some() || self.api_process.is_some());
-        if replacing_same_model {
-            required = required.saturating_sub(estimate_model_runtime_memory(
-                model_path,
-                context_tokens,
-            ));
+        // API startup stops the current worker/API before loading the target.
+        // Credit that model's resident weights now so admission reflects the
+        // post-switch state, not the temporary overlap before teardown.
+        let loaded_model_to_release = replaces_loaded_model
+            .then_some(self.loaded_model.as_deref())
+            .flatten();
+        if let Some(loaded_model) = loaded_model_to_release {
+            let previous_options = if self.api_process.is_some() {
+                self.last_api_model_options.as_ref()
+            } else {
+                self.last_worker_model_options.as_ref()
+            };
+            let mut releasable = estimate_model_weight_memory(loaded_model);
+            if let Some(options) = previous_options {
+                for draft_path in [
+                    options.mtp_draft_model.as_deref(),
+                    options.dflash_draft_model.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    releasable = releasable
+                        .saturating_add(estimate_model_weight_memory(draft_path));
+                }
+            }
+            required = required.saturating_sub(releasable);
         }
 
         let available = total.saturating_sub(used);
-        let headroom = (total / 5).max(MINIMUM_MEMORY_HEADROOM);
+        // Model-load admission estimates resident weights only. KV cache grows
+        // with actual requests and is checked by API admission; context matrix
+        // benchmarks pass a context and reserve their full projected peak.
+        // Keep the oMLX aggressive-tier reserve (2%, 1.5–4 GiB) on top.
+        let headroom = memory_headroom(total);
         let needed = required.saturating_add(headroom);
         if available < needed {
             return Err(format!(
@@ -1663,10 +1749,7 @@ impl Backend {
         if already_running {
             return Ok(());
         }
-        let max_context = model_options
-            .and_then(|options| options.max_context_tokens)
-            .unwrap_or(self.configured_max_context);
-        self.ensure_memory_budget(model_path, model_options, max_context)?;
+        self.ensure_memory_budget(model_path, model_options, None, true)?;
         if self.configured_auth_required
             && self.configured_api_key.as_deref().is_none_or(str::is_empty)
         {
@@ -1720,9 +1803,15 @@ impl Backend {
             .map_err(|error| format!("could not serialize chat template settings: {error}"))?;
         let mtp_draft_model = model_options.and_then(|options| options.mtp_draft_model.as_deref());
         let dflash_draft_model = model_options.and_then(|options| options.dflash_draft_model.as_deref());
+        let run_log_path = self
+            .configured_history_db
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("logs/server.log");
         let mut child = Command::new(&self.python)
             .current_dir(&self.root)
             .env("PYTHONPATH", self.root.join("python"))
+            .env("MINIMLX_SUPERVISOR_PID", std::process::id().to_string())
             .env_remove("MINIMLX_MTP_DRAFT_MODEL")
             .env_remove("MINIMLX_DFLASH_DRAFT_MODEL")
             .arg("-m")
@@ -1754,6 +1843,8 @@ impl Backend {
                 &frequency_penalty.to_string(),
                 "--log-level",
                 &self.configured_log_level,
+                "--log-file",
+                &run_log_path.to_string_lossy(),
                 "--history-db",
                 &self.configured_history_db.to_string_lossy(),
             ])
@@ -1805,7 +1896,8 @@ impl Backend {
             }
             if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
                 return Err(format!(
-                    "API server exited during startup ({status}); inspect the Run log"
+                    "API server exited during startup ({status}); inspect {}",
+                    run_log_path.display()
                 ));
             }
             if Instant::now() >= deadline {
@@ -1839,7 +1931,8 @@ impl Backend {
         auth_required: bool,
         api_key: Option<String>,
     ) -> Result<(), String> {
-        self.configured_auth_required = auth_required || host != "127.0.0.1";
+        let loopback_host = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+        self.configured_auth_required = auth_required || !loopback_host;
         if !(1024..=65535).contains(&port) {
             return Err("Choose an unprivileged port between 1024 and 65535".into());
         }
@@ -1858,11 +1951,11 @@ impl Backend {
         if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
             return Err("Repetition penalty must be greater than 0".into());
         }
-        if host != "127.0.0.1" && api_key.as_deref().is_none_or(str::is_empty) {
-            return Err("LAN binding requires an API key stored in Keychain".into());
+        if !loopback_host && api_key.as_deref().is_none_or(str::is_empty) {
+            return Err("LAN binding requires an API key".into());
         }
         if auth_required && api_key.as_deref().is_none_or(str::is_empty) {
-            return Err("API-key authentication requires a key stored in Keychain".into());
+            return Err("API-key authentication requires an API key".into());
         }
         if !["DEBUG", "INFO", "WARNING", "ERROR"].contains(&log_level.as_str()) {
             return Err("Unsupported log level".into());
@@ -1883,10 +1976,14 @@ impl Backend {
     }
 
     pub fn api_running(&mut self) -> bool {
-        self.api_process
+        let child_is_alive = self
+            .api_process
             .as_mut()
-            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
-            && self.api_port.is_some_and(api_healthcheck)
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        child_is_alive
+            || self
+                .api_port
+                .is_some_and(|port| minimlx_api_listener_alive(port, &self.root))
     }
 
     pub fn api_metrics(&mut self) -> Option<Value> {
@@ -1900,20 +1997,34 @@ impl Backend {
         let exited = self
             .api_process
             .as_mut()
-            .is_some_and(|child| child.try_wait().ok().flatten().is_some());
+            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)));
         if exited {
             self.api_process.take();
-            self.api_port = None;
-            if self.worker.is_none() {
-                self.loaded_model = None;
+            let listener_alive = self
+                .api_port
+                .is_some_and(|port| minimlx_api_listener_alive(port, &self.root));
+            if !listener_alive {
+                self.api_port = None;
+                if self.worker.is_none() {
+                    self.loaded_model = None;
+                }
             }
         }
     }
 
     pub fn stop_api(&mut self) {
+        let port = self.api_port.take();
         if let Some(mut child) = self.api_process.take() {
-            let _ = child.kill();
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
             let _ = child.wait();
+        }
+        if let Some(port) = port {
+            // A runtime can outlive its original Child handle (for example,
+            // after the desktop process is replaced during development).
+            // Only stop a listener that is verified as this MiniMLX runtime.
+            let _ = ensure_api_port_available(port, &self.root);
         }
         self.api_port = None;
         if self.worker.is_none() {
@@ -2137,6 +2248,16 @@ fn is_minimlx_api_process(pid: u32, app_root: &Path) -> bool {
         return false;
     };
     cwd.canonicalize().is_ok_and(|cwd| cwd == app_root)
+}
+
+fn minimlx_api_listener_alive(port: u16, app_root: &Path) -> bool {
+    let Ok(process_ids) = listening_process_ids(port) else {
+        return false;
+    };
+    !process_ids.is_empty()
+        && process_ids
+            .iter()
+            .all(|pid| is_minimlx_api_process(*pid, app_root))
 }
 
 fn api_healthcheck(port: u16) -> bool {
@@ -2440,9 +2561,17 @@ fn model_display_name(path: &Path) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+fn estimate_model_weight_memory(model_path: &str) -> u64 {
+    // MLX loads packed/quantized tensors close to their on-disk size. Allow
+    // 25% for loader/runtime overhead instead of doubling every model's size.
+    directory_size(Path::new(model_path))
+        .saturating_mul(MODEL_WEIGHT_OVERHEAD_NUMERATOR)
+        / MODEL_WEIGHT_OVERHEAD_DENOMINATOR
+}
+
 fn estimate_model_runtime_memory(model_path: &str, context_tokens: u32) -> u64 {
     let path = Path::new(model_path);
-    let weight_memory = directory_size(path).saturating_mul(2);
+    let weight_memory = estimate_model_weight_memory(model_path);
     let config = fs::read_to_string(path.join("config.json"))
         .ok()
         .and_then(|contents| serde_json::from_str::<Value>(&contents).ok());
@@ -2475,6 +2604,14 @@ fn estimate_model_runtime_memory(model_path: &str, context_tokens: u32) -> u64 {
         })
         .unwrap_or(0);
     weight_memory.saturating_add(kv_cache.saturating_mul(3) / 2)
+}
+
+fn memory_headroom(total_memory: u64) -> u64 {
+    total_memory
+        .saturating_mul(MEMORY_HEADROOM_PERCENT)
+        .checked_div(100)
+        .unwrap_or(0)
+        .clamp(MINIMUM_MEMORY_HEADROOM, MAXIMUM_MEMORY_HEADROOM)
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -2563,10 +2700,12 @@ mod model_discovery_tests {
         huggingface_model_search_params, huggingface_model_search_url,
         is_unneeded_huggingface_metadata, should_retry_download_status, download_retry_delay,
         estimate_model_runtime_memory, is_managed_model_dir, is_model_dir,
-        model_display_name, same_filesystem_path, modelscope_model_search_params, parse_content_range_start,
+        model_display_name, same_filesystem_path, modelscope_file_url,
+        modelscope_model_search_params, modelscope_model_search_url, parse_content_range_start,
         parse_huggingface_repo_size, save_download_manifest, sort_model_search_results,
         validate_external_model_directory, validate_remote_path, validate_repo_id, Backend,
-        DownloadContext, ModelSearchResult, ModelSearchSort, RemoteModelFile,
+        DownloadContext, ModelSearchResult, ModelSearchSort, ModelSearchSortDirection,
+        RemoteModelFile,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2643,6 +2782,7 @@ mod model_discovery_tests {
         let context = DownloadContext {
             download_directory: PathBuf::new(),
             huggingface_endpoint: "https://mirror.example/hub".into(),
+            modelscope_endpoint: "https://modelscope.cn".into(),
             http_proxy: String::new(),
             https_proxy: String::new(),
             no_proxy: String::new(),
@@ -2728,7 +2868,9 @@ mod model_discovery_tests {
             r#"{"model_type":"test","num_hidden_layers":2,"num_key_value_heads":1,"hidden_size":16,"num_attention_heads":4}"#,
             "memory-estimate",
         );
-        let weights = super::directory_size(&model).saturating_mul(2);
+        let weights = super::directory_size(&model)
+            .saturating_mul(super::MODEL_WEIGHT_OVERHEAD_NUMERATOR)
+            / super::MODEL_WEIGHT_OVERHEAD_DENOMINATOR;
         let zero_context = estimate_model_runtime_memory(&model.display().to_string(), 0);
         let with_context = estimate_model_runtime_memory(&model.display().to_string(), 8);
         let expected_kv_bytes = 8_u64 * 2 * 1 * 4 * 4 * 3 / 2;
@@ -2739,10 +2881,21 @@ mod model_discovery_tests {
     }
 
     #[test]
+    fn memory_guard_keeps_a_scaled_but_bounded_os_reserve() {
+        assert_eq!(super::memory_headroom(64 * super::GIB), 1 * super::GIB + super::GIB / 2);
+        assert_eq!(super::memory_headroom(16 * super::GIB), 1 * super::GIB + super::GIB / 2);
+        assert_eq!(
+            super::memory_headroom(128 * super::GIB),
+            2 * super::GIB + super::GIB * 56 / 100
+        );
+    }
+
+    #[test]
     fn short_model_search_query_returns_without_network_or_python() {
         let context = DownloadContext {
             download_directory: PathBuf::new(),
             huggingface_endpoint: "not-a-valid-endpoint".into(),
+            modelscope_endpoint: "https://modelscope.cn".into(),
             http_proxy: String::new(),
             https_proxy: String::new(),
             no_proxy: String::new(),
@@ -2809,6 +2962,7 @@ mod model_discovery_tests {
         let context = DownloadContext {
             download_directory: PathBuf::new(),
             huggingface_endpoint: "https://mirror.example/hub/".into(),
+            modelscope_endpoint: "https://modelscope.cn".into(),
             http_proxy: String::new(),
             https_proxy: String::new(),
             no_proxy: String::new(),
@@ -2818,6 +2972,35 @@ mod model_discovery_tests {
             huggingface_model_search_url(&context),
             "https://mirror.example/hub/api/models"
         );
+    }
+
+    #[test]
+    fn modelscope_search_and_download_use_the_configured_endpoint() {
+        let context = DownloadContext {
+            download_directory: PathBuf::new(),
+            huggingface_endpoint: "https://huggingface.co".into(),
+            modelscope_endpoint: "https://models.example/hub/".into(),
+            http_proxy: String::new(),
+            https_proxy: String::new(),
+            no_proxy: String::new(),
+            ca_bundle: String::new(),
+        };
+        assert_eq!(
+            modelscope_model_search_url(&context),
+            "https://models.example/hub/openapi/v1/models"
+        );
+        let file_url = modelscope_file_url(
+            &context,
+            "owner/model",
+            "master",
+            "weights/model.safetensors",
+        )
+        .unwrap();
+        assert_eq!(
+            file_url.origin().ascii_serialization(),
+            "https://models.example"
+        );
+        assert!(file_url.path().starts_with("/hub/api/v1/models/owner/model/repo"));
     }
 
     #[test]
@@ -2852,16 +3035,29 @@ mod model_discovery_tests {
             },
         ];
 
-        for (sort, expected) in [
-            (ModelSearchSort::Name, ["A/model", "b/model", "z/model"]),
-            (ModelSearchSort::Size, ["A/model", "b/model", "z/model"]),
+        for (sort, direction, expected) in [
             (
-                ModelSearchSort::Downloads,
+                ModelSearchSort::Name,
+                ModelSearchSortDirection::Ascending,
                 ["A/model", "b/model", "z/model"],
             ),
-            (ModelSearchSort::Likes, ["b/model", "z/model", "A/model"]),
+            (
+                ModelSearchSort::Size,
+                ModelSearchSortDirection::Descending,
+                ["A/model", "b/model", "z/model"],
+            ),
+            (
+                ModelSearchSort::Downloads,
+                ModelSearchSortDirection::Descending,
+                ["A/model", "b/model", "z/model"],
+            ),
+            (
+                ModelSearchSort::Likes,
+                ModelSearchSortDirection::Descending,
+                ["b/model", "z/model", "A/model"],
+            ),
         ] {
-            sort_model_search_results(&mut results, sort);
+            sort_model_search_results(&mut results, sort, direction);
             assert_eq!(
                 results
                     .iter()

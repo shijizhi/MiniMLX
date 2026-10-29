@@ -198,7 +198,11 @@ class MLXVLMAdapter:
     def load(
         self, descriptor: ModelDescriptor, plan: ExecutionPlan | None = None
     ) -> "MLXVLMAdapter":
-        if plan is not None and plan.backend_adapter not in {"mlx-vlm-runtime", "qwen35-vlm"}:
+        if plan is not None and plan.backend_adapter not in {
+            "mlx-vlm-runtime",
+            "qwen35-vlm",
+            "deepseek41-mlx-vlm-runtime",
+        }:
             raise ValueError(f"MLXVLMAdapter cannot load backend {plan.backend_adapter!r}")
         try:
             from mlx_vlm.utils import load
@@ -207,8 +211,19 @@ class MLXVLMAdapter:
         except ImportError as exc:
             raise RuntimeError("mlx-vlm could not access the Apple Metal device") from exc
 
+        load_options: dict[str, Any] = {}
+        if plan is not None and plan.backend_adapter == "deepseek41-mlx-vlm-runtime":
+            # mlx-vlm's offload directory activates its native routed-expert
+            # pager. Keep loading lazy and bound the resident expert cache.
+            load_options = {
+                "lazy": True,
+                "expert_cache_gb": max(
+                    0.0,
+                    float(os.environ.get("MINIMLX_DEEPSEEK41_EXPERT_CACHE_GB", "8")),
+                ),
+            }
         try:
-            self.model, self.processor = load(descriptor.model_dir)
+            self.model, self.processor = load(descriptor.model_dir, **load_options)
         except (ImportError, ModuleNotFoundError):
             raise
         except Exception as exc:
@@ -493,7 +508,7 @@ class MLXVLMAdapter:
         if os.environ.get("MINIMLX_IGNORE_EOS") == "1":
             # mlx-vlm owns EOS handling through tokenizer.stopping_criteria;
             # changing mlx-lm's tokenizer.eos_token_ids is not sufficient for
-            # the Qwen3.8 text route, which is loaded through this VLM backend.
+            # multimodal generation through this backend.
             kwargs["stopping_criteria"] = lambda _token: False
         kwargs.update(
             input_ids=input_ids,

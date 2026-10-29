@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
+
+from .supervisor import install_parent_watchdog
+
+install_parent_watchdog()
 
 from .api import Worker, serve_unix
 from .runtime import Runtime
@@ -84,6 +89,7 @@ def main() -> None:
     api.add_argument("--force-sampling", action="store_true")
     api.add_argument("--chat-template-kwargs", type=json.loads, default=None)
     api.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    api.add_argument("--log-file", default=None)
     api.add_argument("--record-history", action=argparse.BooleanOptionalAction, default=True)
     api.add_argument("--history-db", default="~/.minimlx/usage.sqlite3")
     args = parser.parse_args()
@@ -99,8 +105,31 @@ def main() -> None:
             )
         )
         return
+    startup_log_handler = None
+    if args.command == "api" and args.log_file:
+        startup_log_path = Path(args.log_file).expanduser()
+        startup_log_path.parent.mkdir(parents=True, exist_ok=True)
+        startup_log_handler = logging.FileHandler(startup_log_path, encoding="utf-8")
+        startup_log_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root_logger = logging.getLogger()
+        root_logger.setLevel(getattr(logging, args.log_level, logging.INFO))
+        root_logger.addHandler(startup_log_handler)
     runtime = _runtime(args)
-    runtime.load(args.model_dir)
+    try:
+        runtime.load(args.model_dir)
+    except Exception:
+        if args.command == "api":
+            logging.getLogger("minimlx.api.startup").exception(
+                "API model startup failed (model=%s)", args.model_dir
+            )
+        raise
+    finally:
+        if startup_log_handler is not None:
+            root_logger = logging.getLogger()
+            root_logger.removeHandler(startup_log_handler)
+            startup_log_handler.close()
     if args.command == "api":
         from .api.http import serve_http
 
@@ -124,6 +153,7 @@ def main() -> None:
                 **({"chat_template_kwargs": args.chat_template_kwargs} if args.chat_template_kwargs else {}),
             },
             log_level=args.log_level,
+            log_file_path=(str(Path(args.log_file).expanduser()) if args.log_file else None),
             history_db_path=(str(Path(args.history_db).expanduser()) if args.record_history else None),
         )
     elif args.command == "generate":

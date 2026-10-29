@@ -7,6 +7,9 @@ members = [
     "crates/minimlx-gpui",
 ]
 
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
+
 [workspace.package]
 edition = "2021"
 license = "MIT"

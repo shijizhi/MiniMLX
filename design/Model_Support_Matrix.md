@@ -16,11 +16,17 @@ The broader support and performance process is defined in
 [`Model_Support_and_Performance_Plan.md`](Model_Support_and_Performance_Plan.md).
 Historical and future MiniMLX/oMLX numbers are maintained in
 [`Model_Benchmark_Comparison.md`](Model_Benchmark_Comparison.md).
-The current hardware authority for this matrix is a MacBook Air M4 with 24 GB
-unified memory; 32K results are conditional on memory safety.
+Older records include results from a MacBook Air M4 with 24 GB unified memory.
+Each new model record identifies the actual device used; 32K results remain
+conditional on that device's available memory.
 
 This matrix tracks model-family compatibility separately from performance
-optimization. A model is not considered supported from `config.json` alone:
+optimization. Adapter/provider names in older records are the route used when
+the measurement was collected; they do not define an optimization layer or
+override the baseline-plus-overlay architecture. Qwen3.8's shared upstream
+`qwen3_5` config identity establishes loader compatibility only; it does not
+place Qwen3.8 in the Qwen3.5 optimization scope. A model is not considered
+supported from `config.json` alone:
 it must load through its adapter, execute a short prefill and decode, and pass
 the family-specific shape checks.
 
@@ -47,9 +53,14 @@ Checkpoint: `mlx-community/Qwen3.8-27B-4bit`, local path
 complete three-shard affine Q4/group-64 checkpoint. Its config declares
 `qwen3_5` / `Qwen3_5ForConditionalGeneration`, a 64-layer hybrid text stack, a
 vision tower, 262,144 max positions, and a video preprocessor. The installed
-environment is `mlx-vlm 0.7.2`, MLX 0.32.2, and mlx-lm 0.31.3. MiniMLX loads it
-through the existing Qwen3.5 VLM route (`qwen35-vlm`); no Qwen3.8-only adapter
-or branch was added.
+environment is `mlx-vlm 0.7.2`, MLX 0.32.2, and mlx-lm 0.31.3. Historical
+functional checks loaded it through the shared upstream `mlx-vlm` implementation
+using the checkpoint's `qwen3_5` architecture declaration. This is loader
+compatibility evidence, not evidence that Qwen3.8 uses or inherits a Qwen3.5
+MiniMLX optimization. The current resolver excludes Qwen3.8 from Qwen3.5
+providers and routes its text and media requests through the shared upstream
+MLX-LM and MLX-VLM implementations respectively; device-side regression of this
+new route remains to be run.
 
 Functional checks on the actual checkpoint:
 
@@ -98,7 +109,8 @@ remain follow-up validation rather than blockers for the implemented path.
 
 The first cross-family checkpoint is the locally available
 `mlx-community/Qwen2.5-0.5B-Instruct-4bit`. Its descriptor resolves to the
-Qwen2 family adapter and the standard `mlx-lm` backend. The fixed short prompt
+shared standard MLX-LM baseline; Qwen2.5 is the tested family identity, not a
+Qwen2-only performance adapter. The fixed short prompt
 passed twice with identical tokens; the 1K/4K/16K context matrix passed with
 five measured runs per context. This evidence applies to this checkpoint, not
 every Qwen2 conversion or task.
@@ -354,3 +366,145 @@ cd /Users/jizhishi/mycode/ai/minimlx
 3. Layer counts and linear/full-attention split are reported.
 4. Short prefill and greedy decode complete.
 5. Generated output is non-empty and the process exits cleanly.
+
+## Llama 3.2 3B Instruct MLX 4-bit
+
+- Checkpoint: `mlx-community/Llama-3.2-3B-Instruct-4bit`
+- Architecture: `llama` / `LlamaForCausalLM`; 28 layers, hidden size 3072,
+  24 attention heads, 8 KV heads, max positions 131,072.
+- Quantization: MLX affine Q4, group size 64; checkpoint size 1.807 GB.
+- Route: `mlx-lm-standard` baseline / `mlx-lm-standard-runtime`; no acceleration
+  and no optimization provider. This validates the generic route for this
+  checkpoint only.
+- Compatibility: two independent Metal loads and 16-token greedy generations
+  passed. Both runs produced the same token sequence
+  `[37046, 21043, 48044, 17792, 49792, 118034, 103129, 46034, 3922, 113961,
+  104908, 28469, 5486, 126427, 34208, 122903]` and text
+  `我是一个人工智能助手，能够提供信息、答案和建议`.
+- Hardware: MacBook Pro, Apple M5 Pro, 64 GB unified memory; macOS 27.0.1.
+- Runtime: Python 3.13, MLX 0.32.2, mlx-lm 0.31.3, Transformers 5.17.0,
+  Tokenizers 0.23.2. Source checkout HEAD at test time: `188ed46` plus the
+  uncommitted architecture/overlay changes in this worktree.
+- Context matrix: `warmup=32`, `max_tokens=128`, five measured runs per
+  context, prefill step 1024, `Resources/BenchmarkCorpus/code_python.txt`,
+  EOS enabled. Every measured run generated 128/128 tokens.
+
+| Context | Median TTFT | Median TPOT | Median PP TPS | Median TG TPS | Generated | Median E2E | Peak MLX memory |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 259.9 ms | 8.88 ms | 3,940.3 | 113.52 | 128/128 | 1,691.6 ms | 2.460 GiB |
+| 4K | 1,083.2 ms | 10.42 ms | 3,781.2 | 96.74 | 128/128 | 2,709.1 ms | 2.691 GiB |
+| 8K | 2,289.6 ms | 11.29 ms | 3,577.9 | 89.31 | 128/128 | 3,988.4 ms | 3.181 GiB |
+| 16K | 5,998.9 ms | 16.63 ms | 2,731.2 | 60.62 | 128/128 | 8,394.9 ms | 3.986 GiB |
+
+Five raw samples per context (TTFT ms / TPOT ms / PP TPS / TG TPS / E2E ms):
+
+- 1K: `259.9/8.84/3940.3/114.05/1654.4`; `259.7/9.12/3942.4/110.57/1705.7`;
+  `259.8/8.88/3940.9/113.52/1691.6`; `260.1/8.87/3937.5/113.60/1665.4`;
+  `261.4/8.97/3916.6/112.41/1708.9`.
+- 4K: `1080.9/10.47/3789.4/96.25/2709.1`; `1083.2/10.37/3781.2/97.14/2682.6`;
+  `1097.9/10.42/3730.6/96.74/2717.1`; `1082.5/10.50/3783.8/96.03/2697.8`;
+  `1089.1/10.41/3760.8/96.80/2714.6`.
+- 8K: `2581.1/13.46/3173.8/74.88/4574.0`; `2582.8/13.99/3171.8/72.04/4651.7`;
+  `2236.6/11.29/3662.8/89.31/3982.3`; `2239.0/11.13/3658.8/90.59/3926.7`;
+  `2289.6/11.20/3577.9/89.95/3988.4`.
+- 16K: `5751.7/16.56/2848.6/60.87/8141.8`; `5818.4/16.68/2815.9/60.44/8223.5`;
+  `5998.9/16.60/2731.2/60.72/8394.9`; `6151.3/16.83/2663.5/59.89/8583.8`;
+  `6198.0/16.63/2643.4/60.62/8606.7`.
+
+- 32K boundary: 32,767 prompt tokens + 1 generated token passed; TTFT 14,864.2 ms,
+  PP 2,204.4 TPS, E2E 15,155.1 ms, suite peak 5.726 GiB. Single-token TPOT/TG TPS
+  are not meaningful performance measurements.
+- The benchmark tokenizer emitted a long-corpus length warning because it
+  tokenizes the full 313,611-token source before slicing to each requested
+  context. Exact requested contexts were processed and all generated tokens
+  completed; the warning did not indicate a model context failure.
+- Commands: `tools/verify_model_support.py <model-dir> --prompt '用一句话介绍你自己。' --max-tokens 16`
+  (run twice); `tools/benchmark_context_matrix.py <model-dir>
+  Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128
+  --repeats 5 --step 1024 --contexts 1024 4096 8192 16384`; and the 32K
+  boundary variant with `--warmup 1 --max-tokens 1 --repeats 1 --contexts 32767`.
+
+Result: supported for text generation on this checkpoint under the project's
+load/smoke/context gate; repeated greedy output was token-identical and context
+passed through 32K. This is not a separate language-quality evaluation or a
+benchmark comparison against another runtime. No Llama-specific optimization
+was added.
+
+## Gemma 4 12B IT MLX 4-bit
+
+- Checkpoint: `mlx-community/gemma-4-12B-it-4bit`; local directory
+  `~/.minimlx/models/mlx-community--gemma-4-12B-it-4bit`.
+- Architecture: `gemma4_unified` / `Gemma4UnifiedForConditionalGeneration`;
+  48 text layers, hidden size 3840, 16 attention heads, 8 KV heads, maximum
+  position length 262,144. The checkpoint also contains vision and audio
+  components; this run validates text generation only.
+- Quantization: MLX affine Q4, group size 64; checkpoint size 6.3 GiB on disk.
+- Route: family-neutral `mlx-vlm-generation` baseline / `mlx-vlm-runtime`;
+  no Gemma-specific adapter, acceleration, or optimization provider.
+- Compatibility: two independent Metal loads and 8-token greedy generations
+  passed. Both produced the identical token sequence
+  `[236776, 2028, 25537, 563, 496, 1944, 1076, 529]` and text
+  `A model adapter is a small set of`.
+- Context matrix: warmup 32 tokens at 2K context; five measured runs per
+  context; 128 output tokens; prefill step 1024; EOS enabled. All 15 runs
+  generated 128/128 tokens.
+- Hardware: MacBook Pro, Apple M5 Pro, 64 GB unified memory; macOS 27.0.1.
+- Runtime: Python 3.13, MLX 0.32.2, mlx-lm 0.31.3, mlx-vlm 0.7.2.
+
+| Context | Median TTFT | Median TPOT | Median PP TPS | Median TG TPS | Generated | Median E2E | Peak MLX memory |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 948.7 ms | 28.12 ms | 1,079.3 | 35.84 | 128/128 | 4,922.1 ms | 7.347 GiB |
+| 4K | 3,850.0 ms | 28.71 ms | 1,063.9 | 35.11 | 128/128 | 7,919.8 ms | 7.771 GiB |
+| 8K | 8,309.6 ms | 29.18 ms | 985.9 | 34.54 | 128/128 | 12,444.2 ms | 7.985 GiB |
+| 16K | 17,704.0 ms | 29.52 ms | 925.4 | 34.14 | 128/128 | 21,887.7 ms | 8.442 GiB |
+
+- Route resolution initially selected `mlx-lm-standard` because the broad
+  `gemma` family token matched `gemma4_unified`. The family-neutral VLM route
+  now ranks above broad text-family matches when required vision components
+  are present; Qwen3.5's more specific provider keeps higher priority. The
+  corrected plan was confirmed by both inspect and actual model loading.
+- Commands: `tools/verify_model_support.py <model-dir> --prompt 'Write a short
+  sentence explaining what a model adapter does.' --max-tokens 8` (run twice);
+  `tools/benchmark_context_matrix.py <model-dir>
+  Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128
+  --repeats 5 --step 1024 --contexts 1024 4096 8192 16384`. The 8K context
+  was measured in a separate follow-up run with the same settings.
+
+Result: `loadable`, `smoke-pass`, and text-only `context-pass` through 16K for
+this Gemma 4 checkpoint. Image and audio input are not validated by these runs;
+do not treat the text results as multimodal acceptance or a cross-runtime
+performance comparison.
+
+## Mistral Nemo Instruct 2407 MLX 4-bit
+
+- Checkpoint: `mlx-community/Mistral-Nemo-Instruct-2407-4bit`; local directory
+  `~/.minimlx/models/mlx-community--Mistral-Nemo-Instruct-2407-4bit`.
+- Architecture: `MistralForCausalLM` / `mistral`, 40 layers, hidden size 5120;
+  maximum position length 1,024,000. Quantization is MLX affine Q4, group size
+  64.
+- Route: shared `StandardTextAdapter` / `mlx-lm-standard-runtime`; this is the
+  generic MLX-LM baseline, with no Mistral-specific adapter or performance
+  overlay.
+- Tokenizer: the checkpoint carries the known Mistral regex issue. The shared
+  adapter now enables upstream `fix_mistral_regex=True` for `model_type=mistral`;
+  the subsequent smoke and benchmark loads completed without that warning.
+- Smoke: PASS; exact-response prompt generated `Mistral test passed` (6 tokens).
+- Context matrix: code corpus, warmup 32 tokens at context=2048, output cap 128,
+  five measurements per context, prefill step 1024, EOS enabled. All 20 measured
+  runs generated 128/128 tokens.
+- Hardware: MacBook Pro, Apple M5 Pro, 64 GB unified memory; test ran in the
+  interactive macOS Metal session.
+- Runtime kernels: Q4 native prefill and native FA256 enabled; Q4 dense prefill
+  disabled; Q4 MLP fusion disabled; KV quantization off; autoregressive decode.
+
+| Context | Median TTFT | Median TPOT | Median PP TPS | Median TG TPS | Generated | Median E2E | Peak MLX memory |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 1,253.0 ms | 38.42 ms | 817.3 | 26.23 | 128/128 | 6,442.1 ms | 7.290 GiB |
+| 4K | 5,222.1 ms | 41.58 ms | 784.4 | 24.24 | 128/128 | 10,830.7 ms | 7.592 GiB |
+| 8K | 10,885.2 ms | 45.34 ms | 752.6 | 22.23 | 128/128 | 16,965.1 ms | 8.264 GiB |
+| 16K | 24,561.7 ms | 53.60 ms | 667.1 | 18.80 | 128/128 | 31,706.4 ms | 9.469 GiB |
+
+Result: supported for text generation on this checkpoint under the generic
+MLX-LM baseline and validated through 16K context. This test did not assess
+instruction-following quality, multimodal tasks, or performance against oMLX.
+No Mistral-specific optimization layer was added.

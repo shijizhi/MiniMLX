@@ -43,6 +43,7 @@ impl PythonWorker {
         command
             .current_dir(project_root.as_ref())
             .env("PYTHONPATH", project_root.as_ref().join("python"))
+            .env("MINIMLX_SUPERVISOR_PID", std::process::id().to_string())
             .arg("-m")
             .arg(worker_module)
             .arg("worker")
@@ -132,6 +133,7 @@ impl PythonWorker {
 impl Drop for PythonWorker {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }

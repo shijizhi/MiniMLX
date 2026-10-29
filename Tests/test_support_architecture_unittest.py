@@ -92,6 +92,45 @@ def dflash_draft_descriptor():
 
 
 class SupportArchitectureTests(unittest.TestCase):
+    def test_qwen35_mtp_stream_uses_specialized_overlay_without_baseline_adapter(self):
+        from minimlx_runtime.adapters.qwen35 import Qwen35Adapter
+
+        class FakeOverlay:
+            def generate(self, *args, on_token=None, **kwargs):
+                on_token("first", [101])
+                on_token(" second", [102])
+                return [1, 2], [101, 102], "first second", 5.0, 4.0
+
+        adapter = Qwen35Adapter.__new__(Qwen35Adapter)
+        adapter._mtp_enabled = True
+        adapter._dflash_enabled = False
+        adapter._optimization_active = False
+        adapter._baseline_adapter = None
+        adapter._optimization_overlay = FakeOverlay()
+        adapter._tokenizer = None
+        events = list(adapter.stream_generate("prompt", max_tokens=2))
+
+        self.assertEqual([event["delta"] for event in events if event["event"] == "delta"], ["first", " second"])
+        self.assertEqual(events[-1]["usage"], {"prompt_tokens": 2, "completion_tokens": 2})
+
+    def test_qwen35_baseline_stream_forwards_events(self):
+        from minimlx_runtime.adapters.qwen35 import Qwen35Adapter
+
+        class FakeBaseline:
+            def stream_generate(self, *args, **kwargs):
+                yield {"event": "delta", "delta": "hello", "token_ids": [101]}
+                yield {"event": "done", "text": "hello", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        adapter = Qwen35Adapter.__new__(Qwen35Adapter)
+        adapter._dflash_enabled = False
+        adapter._mtp_enabled = False
+        adapter._optimization_active = False
+        adapter._baseline_adapter = FakeBaseline()
+        adapter._optimization_overlay = None
+        events = list(adapter.stream_generate("prompt", max_tokens=1))
+        self.assertEqual([event["delta"] for event in events if event["event"] == "delta"], ["hello"])
+        self.assertEqual(events[-1]["event"], "done")
+
     def test_failed_mtp_cleanup_synchronizes_resets_and_drops_request_caches(self):
         from minimlx_runtime.adapters.qwen35 import _cleanup_failed_mtp_request
 
@@ -193,6 +232,23 @@ class SupportArchitectureTests(unittest.TestCase):
 
         self.assertTrue(issubclass(Qwen35Adapter, MLXVLMAdapter))
         self.assertIs(Qwen35Adapter._image_input, MLXVLMAdapter._image_input)
+
+    def test_qwen35_optimization_algorithms_are_owned_by_overlay(self):
+        from minimlx_runtime.adapters.qwen35 import Qwen35Adapter
+        from minimlx_runtime.adapters.qwen35_overlay import Qwen35PerformanceOverlay
+
+        self.assertFalse(hasattr(Qwen35Adapter, "_generate_optimized"))
+        self.assertFalse(hasattr(Qwen35Adapter, "_install_q4_native_prefill"))
+        self.assertFalse(hasattr(Qwen35Adapter, "_qwen_cached_image_features"))
+        self.assertTrue(hasattr(Qwen35PerformanceOverlay, "_generate_optimized"))
+        self.assertTrue(hasattr(Qwen35PerformanceOverlay, "_install_q4_native_prefill"))
+        self.assertTrue(hasattr(Qwen35PerformanceOverlay, "_qwen_cached_image_features"))
+
+        host = types.SimpleNamespace(model=object())
+        overlay = Qwen35PerformanceOverlay(host)
+        overlay._greedy_skip_logsumexp = True
+        self.assertIs(overlay.model, host.model)
+        self.assertTrue(host._greedy_skip_logsumexp)
 
     def test_qwen35_vision_cache_is_a_hook_on_shared_generation_path(self):
         from unittest.mock import patch
@@ -322,9 +378,9 @@ class SupportArchitectureTests(unittest.TestCase):
         )
         self.assertEqual(decision.status, SupportStatus.MISSING_COMPONENT)
 
-    def test_qwen2_family_adapter_and_provider_route(self):
+    def test_standard_text_adapter_and_provider_route_supports_qwen2(self):
         from minimlx_runtime.registry import ModelRegistry
-        from minimlx_runtime.adapters.qwen2 import Qwen2Adapter
+        from minimlx_runtime.adapters.mlx_lm_standard import StandardTextAdapter
 
         components = (
             ArtifactComponent("tokenizer", ComponentKind.TOKENIZER, "tokenizer.json"),
@@ -336,27 +392,38 @@ class SupportArchitectureTests(unittest.TestCase):
             components=components,
             metadata={"quantization": {"bits": 4, "group_size": 64}},
         )
-        self.assertTrue(Qwen2Adapter.can_load(model))
-        self.assertFalse(Qwen2Adapter.can_load(descriptor(model_type="qwen3_5")))
-        registry = ModelRegistry([Qwen2Adapter()])
-        self.assertEqual(registry.resolve(model).name, "qwen2-mlx-lm")
-        self.assertEqual(registry.create(model).name, "qwen2-mlx-lm")
+        self.assertTrue(StandardTextAdapter.can_load(model))
+        self.assertTrue(StandardTextAdapter.can_load(descriptor(model_type="qwen3_5")))
+        registry = ModelRegistry([StandardTextAdapter()])
+        self.assertEqual(registry.resolve(model).name, "mlx-lm-standard")
+        self.assertEqual(registry.create(model).name, "mlx-lm-standard")
         decision, plan = CapabilityResolver(builtin_provider_registry()).resolve(
             model,
             text_request(),
             RuntimeEnvironment(backends=frozenset({"mlx-lm"})),
         )
         self.assertEqual(decision.status, SupportStatus.SUPPORTED)
-        self.assertEqual(plan.family_adapter, "qwen2-mlx-lm")
-        self.assertEqual(plan.backend_adapter, "qwen2-runtime")
+        self.assertEqual(plan.family_adapter, "mlx-lm-standard")
+        self.assertEqual(plan.backend_adapter, "mlx-lm-standard-runtime")
         self.assertEqual(
             plan.component_adapters[ComponentKind.TOKENIZER],
-            "qwen2-tokenizer-component",
+            "mlx-lm-tokenizer-component",
         )
+        stream_request = InferenceRequest(
+            ModelTask.GENERATION,
+            text_request().messages,
+            stream=True,
+        )
+        stream_decision, stream_plan = CapabilityResolver(
+            builtin_provider_registry()
+        ).resolve(model, stream_request, RuntimeEnvironment(backends=frozenset({"mlx-lm"})))
+        self.assertEqual(stream_decision.status, SupportStatus.SUPPORTED)
+        self.assertEqual(stream_plan.family_adapter, plan.family_adapter)
+        self.assertEqual(stream_plan.backend_adapter, plan.backend_adapter)
 
     def test_qwen2_adapter_stream_generate_contract(self):
         from unittest.mock import patch
-        from minimlx_runtime.adapters.qwen2 import Qwen2Adapter
+        from minimlx_runtime.adapters.mlx_lm_standard import StandardTextAdapter
 
         seen = {}
 
@@ -376,7 +443,7 @@ class SupportArchitectureTests(unittest.TestCase):
                 seen.update(prompt=prompt, kwargs=kwargs) or iter((Response(),))
             )
         )
-        adapter = Qwen2Adapter()
+        adapter = StandardTextAdapter()
         adapter.model = object()
         adapter.tokenizer = Tokenizer()
         with patch.dict(sys.modules, {"mlx_lm": fake_module}):
@@ -386,7 +453,7 @@ class SupportArchitectureTests(unittest.TestCase):
         self.assertEqual(result[3], 200.0)
 
     def test_qwen2_adapter_uses_checkpoint_chat_template(self):
-        from minimlx_runtime.adapters.qwen2 import Qwen2Adapter
+        from minimlx_runtime.adapters.mlx_lm_standard import StandardTextAdapter
 
         tokenizer = types.SimpleNamespace(
             apply_chat_template=lambda messages, **kwargs: (
@@ -394,7 +461,7 @@ class SupportArchitectureTests(unittest.TestCase):
                 f"|{kwargs['add_generation_prompt']}"
             )
         )
-        adapter = Qwen2Adapter()
+        adapter = StandardTextAdapter()
         adapter.tokenizer = tokenizer
         message = InputMessage(
             "user", (ContentPart(Modality.TEXT, text="hello"),)
@@ -402,13 +469,13 @@ class SupportArchitectureTests(unittest.TestCase):
         self.assertEqual(adapter.format_messages((message,)), "<user>hello|True")
 
     def test_qwen2_adapter_forwards_model_chat_template_parameters(self):
-        from minimlx_runtime.adapters.qwen2 import Qwen2Adapter
+        from minimlx_runtime.adapters.mlx_lm_standard import StandardTextAdapter
 
         seen = {}
         tokenizer = types.SimpleNamespace(
             apply_chat_template=lambda messages, **kwargs: seen.update(kwargs) or "prompt"
         )
-        adapter = Qwen2Adapter()
+        adapter = StandardTextAdapter()
         adapter.tokenizer = tokenizer
         message = InputMessage("user", (ContentPart(Modality.TEXT, text="hello"),))
         self.assertEqual(
@@ -460,11 +527,92 @@ class SupportArchitectureTests(unittest.TestCase):
                     (InputMessage("user", (ContentPart(Modality.IMAGE, uri="file:///fixture.png"),)),),
                 )
                 text_decision, text_plan = resolver.resolve(model, text_request, environment)
+                stream_request = InferenceRequest(
+                    ModelTask.GENERATION,
+                    text_request.messages,
+                    stream=True,
+                )
+                stream_decision, stream_plan = resolver.resolve(
+                    model, stream_request, environment
+                )
                 image_decision, image_plan = resolver.resolve(model, image_request, environment)
                 self.assertEqual(text_decision.status, SupportStatus.SUPPORTED)
-                self.assertEqual(text_plan.family_adapter, "qwen35-vlm")
+                self.assertEqual(stream_decision.status, SupportStatus.SUPPORTED)
+                # Qwen3.5 checkpoints advertise vision metadata, but a
+                # text-only request must stay on the lighter mlx-lm lane.
+                # The VLM provider is reserved for requests that actually
+                # contain image/video input.
+                self.assertEqual(text_plan.family_adapter, "qwen35-mlx-lm")
+                self.assertEqual(stream_plan.family_adapter, text_plan.family_adapter)
+                self.assertEqual(stream_plan.backend_adapter, text_plan.backend_adapter)
+                self.assertEqual(text_plan.baseline_provider, "mlx-lm-standard")
+                self.assertEqual(
+                    text_plan.optimization_providers,
+                    ("qwen35-performance-overlay",),
+                )
                 self.assertEqual(image_decision.status, SupportStatus.SUPPORTED)
                 self.assertEqual(image_plan.family_adapter, "qwen35-vlm")
+                self.assertEqual(image_plan.baseline_provider, "mlx-vlm-generation")
+                self.assertEqual(
+                    image_plan.optimization_providers,
+                    ("qwen35-performance-overlay",),
+                )
+                disabled_environment = RuntimeEnvironment(
+                    backends=frozenset({"mlx-lm", "mlx-vlm"}),
+                    disabled_optimizations=frozenset(
+                        {"qwen35-performance-overlay"}
+                    ),
+                )
+                _, baseline_only_plan = resolver.resolve(
+                    model, text_request, disabled_environment
+                )
+                self.assertEqual(
+                    baseline_only_plan.baseline_provider, "mlx-lm-standard"
+                )
+                self.assertFalse(baseline_only_plan.optimization_providers)
+
+    def test_qwen38_uses_generic_providers_and_is_excluded_from_qwen35_route(self):
+        components = (
+            ArtifactComponent("tokenizer", ComponentKind.TOKENIZER, "tokenizer.json"),
+            ArtifactComponent("weights", ComponentKind.TEXT_WEIGHTS, "model.safetensors"),
+            ArtifactComponent("processor", ComponentKind.PROCESSOR, "processor.json"),
+            ArtifactComponent("vision", ComponentKind.VISION_ENCODER, "model.safetensors"),
+        )
+        model = ModelDescriptor(
+            model_dir="/models/mlx-community--Qwen3.8-27B-4bit",
+            model_type="qwen3_5",
+            architecture="Qwen3_5ForConditionalGeneration",
+            tokenizer_family="qwen",
+            metadata={"repository_id": "mlx-community/Qwen3.8-27B-4bit"},
+            support=CapabilityProfile(
+                tasks=frozenset({ModelTask.GENERATION}),
+                input_modalities=frozenset({Modality.TEXT, Modality.IMAGE}),
+                output_modalities=frozenset({Modality.TEXT}),
+            ),
+            components=components,
+        )
+        resolver = CapabilityResolver(builtin_provider_registry())
+        environment = RuntimeEnvironment(
+            backends=frozenset({"mlx-lm", "mlx-vlm"})
+        )
+        text_decision, text_plan = resolver.resolve(model, text_request(), environment)
+        image_request = InferenceRequest(
+            ModelTask.GENERATION,
+            (InputMessage("user", (ContentPart(Modality.IMAGE, uri="file:///fixture.png"),)),),
+        )
+        image_decision, image_plan = resolver.resolve(model, image_request, environment)
+
+        self.assertEqual(text_decision.status, SupportStatus.SUPPORTED)
+        self.assertEqual(text_plan.family_adapter, "mlx-lm-standard")
+        self.assertEqual(text_plan.baseline_provider, "mlx-lm-standard")
+        self.assertFalse(text_plan.optimization_providers)
+        self.assertEqual(text_plan.backend_adapter, "mlx-lm-standard-runtime")
+        self.assertEqual(image_decision.status, SupportStatus.SUPPORTED)
+        self.assertEqual(image_plan.family_adapter, "mlx-vlm-generation")
+        self.assertEqual(image_plan.baseline_provider, "mlx-vlm-generation")
+        self.assertFalse(image_plan.optimization_providers)
+        self.assertEqual(image_plan.backend_adapter, "mlx-vlm-runtime")
+        self.assertFalse(image_plan.accelerations)
 
     def test_qwen35_text_route_survives_missing_vision_processor(self):
         model = ModelDescriptor(
@@ -1686,7 +1834,7 @@ class SupportArchitectureTests(unittest.TestCase):
         )
         self.assertEqual(released, ["old"])
 
-    def test_optional_acceleration_load_failure_re_resolves_to_base_plan(self):
+    def test_optional_acceleration_and_overlay_failure_re_resolves_to_base_plan(self):
         from unittest.mock import patch
 
         from minimlx_runtime import runtime as runtime_module
@@ -1706,8 +1854,8 @@ class SupportArchitectureTests(unittest.TestCase):
                 return True
 
             def load(self, _descriptor, plan=None):
-                if self.fail and plan.accelerations:
-                    raise RuntimeError("MTP backend initialization failed")
+                if self.fail and (plan.accelerations or plan.optimization_providers):
+                    raise RuntimeError("optional execution layer initialization failed")
                 self.plan = plan
                 return self
 
@@ -1721,6 +1869,8 @@ class SupportArchitectureTests(unittest.TestCase):
             family_adapter="qwen35-mlx-lm",
             backend_adapter="qwen35-runtime",
             accelerations=frozenset({Acceleration.MTP}),
+            baseline_provider="mlx-lm-standard",
+            optimization_providers=("qwen35-performance-overlay",),
         )
         base_plan = ExecutionPlan(
             phase="inference",
@@ -1728,6 +1878,7 @@ class SupportArchitectureTests(unittest.TestCase):
             task_adapter="qwen35-mlx-lm",
             family_adapter="qwen35-mlx-lm",
             backend_adapter="qwen35-runtime",
+            baseline_provider="mlx-lm-standard",
         )
 
         class RegistryStub:
@@ -1748,7 +1899,13 @@ class SupportArchitectureTests(unittest.TestCase):
 
             def resolve(self, _descriptor, _request, environment):
                 self.environments.append(environment)
-                plan = accelerated_plan if environment.accelerations else base_plan
+                plan = (
+                    accelerated_plan
+                    if environment.accelerations
+                    and "qwen35-performance-overlay"
+                    not in environment.disabled_optimizations
+                    else base_plan
+                )
                 return SupportDecision(SupportStatus.SUPPORTED, "ok"), plan
 
         runtime = Runtime.__new__(Runtime)
@@ -1772,6 +1929,10 @@ class SupportArchitectureTests(unittest.TestCase):
         self.assertEqual(runtime._runtime_environment.accelerations, frozenset())
         self.assertEqual(
             runtime._runtime_environment.acceleration_components, {}
+        )
+        self.assertIn(
+            "qwen35-performance-overlay",
+            runtime._runtime_environment.disabled_optimizations,
         )
         self.assertIs(runtime.adapter, runtime.registry.created[1])
         self.assertIn(runtime.registry.created[0], released)
