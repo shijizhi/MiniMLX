@@ -3,8 +3,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::ops::Range;
 use std::net::{IpAddr, UdpSocket};
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,9 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
-use cocoa::appkit::{
-    NSApp, NSApplication, NSApplicationActivationPolicy, NSImage,
-};
+use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy, NSImage};
 #[cfg(target_os = "macos")]
 use cocoa::base::{id, nil};
 #[cfg(target_os = "macos")]
@@ -31,8 +29,8 @@ use objc::{class, msg_send, sel, sel_impl};
 
 use gpui::{
     Action, AnyElement, App, Application, AssetSource, Bounds, ClipboardItem, Context, Entity,
-    FocusHandle, Focusable, FontWeight, Render, SharedString, StatefulInteractiveElement,
-    PathPromptOptions, Subscription, Timer, UniformListScrollHandle, Window, WindowBounds,
+    FocusHandle, Focusable, FontWeight, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement, Subscription, Timer, UniformListScrollHandle, Window, WindowBounds,
     WindowOptions, div, img, prelude::*, px, rgb, size, uniform_list,
 };
 use gpui_component::alert::Alert;
@@ -58,8 +56,8 @@ use serde::Deserialize;
 
 use super::backend::{
     Backend, ContextBenchmarkOptions, IncompleteDownload, ModelEntry, ModelInferenceOptions,
-    ModelSearchResult, ModelSearchSort, ModelSearchSortDirection, sort_model_search_results,
-    validate_external_model_directory,
+    ModelSearchResult, ModelSearchSort, ModelSearchSortDirection, model_display_name,
+    sort_model_search_results, validate_external_model_directory,
 };
 use super::gpu_telemetry::GpuTelemetry;
 use serde_json::Value;
@@ -70,6 +68,7 @@ fn tr(language: &str, source: &str) -> String {
     }
     match source {
         "General" => "通用",
+        "Version:" => "版本：",
         "Language settings" => "语言",
         "Server" => "服务器",
         "Network" => "网络",
@@ -135,6 +134,7 @@ fn tr(language: &str, source: &str) -> String {
         "Use a compatible draft model to accelerate text generation." => "配置草稿加速模型以提升 Apple Silicon 端侧 Token 输出速度",
         "Speculative Decoding" => "推测解码",
         "Speculative decoding is not configured for this model" => "此模型尚未配置推测解码",
+        "Built-in MTP will be enabled automatically" => "将自动启用内置 MTP",
         "Speculative draft configured" => "已配置推测解码草稿模型",
         "DFlash configured" => "已配置 DFlash",
         "MTP configured" => "已配置 MTP",
@@ -147,6 +147,16 @@ fn tr(language: &str, source: &str) -> String {
         "Penalize tokens already present in output." => "降低已生成 Token 再次出现的概率。",
         "Encourage new topics." => "提高生成新主题的倾向。",
         "Advanced sampling" => "高级采样",
+        "Expert cache (GB)" => "专家缓存（GB）",
+        "Leave blank for the 12 GB default. Applies to SSD expert offload after reload." => "留空使用默认的 12 GB；重新加载后应用于 SSD 专家分页。",
+        "Leave blank to use the model's default. Applies to SSD expert offload after reload." => "留空使用该模型的默认值；重新加载后应用于 SSD 专家分页。",
+        "Prepare SSD paging" => "准备 SSD 分页",
+        "SSD paging ready" => "SSD 分页已就绪",
+        "Preparing SSD paging…" => "正在准备 SSD 分页…",
+        "SSD paging preparation failed: " => "SSD 分页准备失败：",
+        "Expert cache must be a number in GB" => "专家缓存必须是以 GB 为单位的数字。",
+        "Expert cache must be greater than 0 and at most 1024 GB" => "专家缓存必须大于 0 且不超过 1024 GB。",
+        "Leave blank for automatic sizing. Applies to SSD expert offload after reload." => "留空为自动分配；用于 SSD 专家分页，重新加载后生效。",
         "Additional controls for API and template behavior." => "配置 API 采样覆盖与聊天模板参数。",
         "Blank fields use application defaults" => "留空项沿用应用默认值",
         "Max output tokens" => "最大输出 Token",
@@ -339,7 +349,7 @@ fn tr(language: &str, source: &str) -> String {
         "Select a model to inspect its details and actions." => "选择模型以查看详细信息和可用操作。",
         "Delete model" => "删除模型",
         "Delete this model?" => "删除这个模型？",
-        "This permanently removes the model files from disk. This action cannot be undone." => "这会永久删除磁盘上的模型文件，且无法撤销。",
+        "This permanently removes the model files from disk. This action cannot be undone." => "这会永久删除模型文件及其目录中的 SSD 分页副本，且无法撤销。",
         "Delete permanently" => "永久删除",
         "Format / quant" => "格式 / 量化",
         "Disk" => "磁盘占用",
@@ -570,9 +580,7 @@ fn local_network_ipv4() -> Option<std::net::Ipv4Addr> {
     // UDP connect selects the system route but does not send a packet.
     socket.connect("192.0.2.1:9").ok()?;
     match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(address) if !address.is_loopback() && !address.is_unspecified() => {
-            Some(address)
-        }
+        IpAddr::V4(address) if !address.is_loopback() && !address.is_unspecified() => Some(address),
         _ => None,
     }
 }
@@ -601,6 +609,11 @@ fn tr_operation(language: &str, message: &str) -> String {
         ("Download failed: ", "下载失败："),
         ("Could not export report: ", "无法导出报告："),
         ("API operation failed: ", "API 操作失败："),
+        ("SSD paging preparation failed: ", "SSD 分页准备失败："),
+        (
+            "Select a model before starting the service",
+            "启动服务前请选择一个模型",
+        ),
         ("Benchmark failed: ", "性能测试失败："),
         ("Inventory refresh failed: ", "刷新模型列表失败："),
     ] {
@@ -617,6 +630,9 @@ fn tr_operation(language: &str, message: &str) -> String {
     }
     if let Some(port) = message.strip_prefix("Running · :") {
         return format!("运行中 · 端口 {port}");
+    }
+    if message == "Choose a model to start the service" {
+        return "请选择用于启动服务的模型".to_string();
     }
     if let Some(draft) = message
         .strip_prefix("Model settings saved · DFlash enabled (")
@@ -1030,9 +1046,7 @@ fn load_desktop_settings() -> DesktopSettings {
     if !had_listen_address && settings.bind_lan {
         settings.listen_address = "0.0.0.0".into();
     }
-    if !["127.0.0.1", "0.0.0.0", "::", "localhost"]
-        .contains(&settings.listen_address.as_str())
-    {
+    if !["127.0.0.1", "0.0.0.0", "::", "localhost"].contains(&settings.listen_address.as_str()) {
         settings.listen_address = "127.0.0.1".into();
     }
     settings.bind_lan = matches!(settings.listen_address.as_str(), "0.0.0.0" | "::");
@@ -1063,7 +1077,10 @@ fn load_desktop_settings() -> DesktopSettings {
             .any(char::is_whitespace)
         || !(settings.modelscope_endpoint.starts_with("https://")
             || settings.modelscope_endpoint.starts_with("http://"))
-        || settings.modelscope_endpoint.chars().any(char::is_whitespace)
+        || settings
+            .modelscope_endpoint
+            .chars()
+            .any(char::is_whitespace)
     {
         DesktopSettings::default()
     } else {
@@ -1096,7 +1113,9 @@ fn api_key_path() -> Option<PathBuf> {
 
 fn store_api_key_file(key: &str) -> Result<(), String> {
     let path = api_key_path().ok_or("home directory is unavailable")?;
-    let parent = path.parent().ok_or("API key path has no parent directory")?;
+    let parent = path
+        .parent()
+        .ok_or("API key path has no parent directory")?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let temporary_path = path.with_extension("tmp");
     let mut options = OpenOptions::new();
@@ -1394,6 +1413,7 @@ struct MiniMlxApp {
     model_config_min_p: String,
     model_config_presence_penalty: String,
     model_config_frequency_penalty: String,
+    model_config_expert_cache_gb: String,
     model_config_force_sampling: bool,
     model_config_chat_template_kwargs: String,
     model_config_mtp_draft: String,
@@ -1443,6 +1463,33 @@ fn benchmark_speculative_draft(report: &str) -> Option<(String, String)> {
         }
     }
     disabled
+}
+
+fn has_embedded_qwen4_mtp(path: &str) -> bool {
+    let root = Path::new(path);
+    let config = std::fs::read_to_string(root.join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let declared = config.as_ref().is_some_and(|config| {
+        config.get("model_type").and_then(Value::as_str) == Some("qwen4_exp")
+            && config
+                .get("text_config")
+                .and_then(|v| v.get("mtp_num_hidden_layers"))
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0)
+    });
+    declared
+        && std::fs::read_to_string(root.join("model.safetensors.index.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|index| index.get("weight_map").and_then(Value::as_object).cloned())
+            .is_some_and(|map| {
+                map.keys().any(|key| {
+                    key.starts_with("mtp.")
+                        || key.starts_with("language_model.mtp.")
+                        || key.starts_with("model.mtp.")
+                })
+            })
 }
 
 fn format_context_label(context: &str) -> String {
@@ -1730,6 +1777,10 @@ impl MiniMlxApp {
             ),
             ("model-config-min-p".into(), self.model_config_min_p.clone()),
             (
+                "model-config-expert-cache".into(),
+                self.model_config_expert_cache_gb.clone(),
+            ),
+            (
                 "model-config-presence-penalty".into(),
                 self.model_config_presence_penalty.clone(),
             ),
@@ -1765,9 +1816,7 @@ impl MiniMlxApp {
             "setting-huggingface-endpoint" => {
                 self.settings_huggingface_endpoint = value.to_string()
             }
-            "setting-modelscope-endpoint" => {
-                self.settings_modelscope_endpoint = value.to_string()
-            }
+            "setting-modelscope-endpoint" => self.settings_modelscope_endpoint = value.to_string(),
             "setting-download-HTTP proxy" => self.settings_http_proxy = value.to_string(),
             "setting-download-HTTPS proxy" => self.settings_https_proxy = value.to_string(),
             "setting-download-No proxy" => self.settings_no_proxy = value.to_string(),
@@ -1784,6 +1833,7 @@ impl MiniMlxApp {
                 self.model_config_repetition_penalty = value.to_string()
             }
             "model-config-min-p" => self.model_config_min_p = value.to_string(),
+            "model-config-expert-cache" => self.model_config_expert_cache_gb = value.to_string(),
             "model-config-presence-penalty" => {
                 self.model_config_presence_penalty = value.to_string()
             }
@@ -1910,7 +1960,9 @@ impl MiniMlxApp {
         let listen_address_options = listen_address_options(&settings.language);
         let selected_listen_address = listen_address_options
             .iter()
-            .position(|option| option == &listen_address_label(&settings.listen_address, &settings.language))
+            .position(|option| {
+                option == &listen_address_label(&settings.listen_address, &settings.language)
+            })
             .map(IndexPath::new);
         let listen_address_dropdown = cx.new(|cx| {
             DropdownState::new(
@@ -2017,8 +2069,7 @@ impl MiniMlxApp {
             settings_max_tokens: settings.max_tokens.to_string(),
             settings_dirty: false,
             settings_message: if startup_security_error {
-                "API service will not start: the configured API key file is missing"
-                    .into()
+                "API service will not start: the configured API key file is missing".into()
             } else {
                 String::new()
             },
@@ -2048,6 +2099,7 @@ impl MiniMlxApp {
             model_config_min_p: String::new(),
             model_config_presence_penalty: String::new(),
             model_config_frequency_penalty: String::new(),
+            model_config_expert_cache_gb: String::new(),
             model_config_force_sampling: false,
             model_config_chat_template_kwargs: String::new(),
             model_config_mtp_draft: String::new(),
@@ -2184,7 +2236,9 @@ impl MiniMlxApp {
                     Some("For example, http://127.0.0.1:7890")
                 }
                 "setting-download-No proxy" => Some("localhost, 127.0.0.1, *.local"),
-                "setting-download-CA bundle" => Some("Leave blank to use the system certificate store."),
+                "setting-download-CA bundle" => {
+                    Some("Leave blank to use the system certificate store.")
+                }
                 _ => None,
             };
             let input = cx.new(|cx| {
@@ -2431,11 +2485,7 @@ impl MiniMlxApp {
                 same_model_path(&entry.path, path) && !is_speculative_draft_entry(entry)
             })
         };
-        let model_path = if self
-            .loaded_model
-            .as_deref()
-            .is_some_and(is_runnable_model)
-        {
+        let model_path = if self.loaded_model.as_deref().is_some_and(is_runnable_model) {
             self.loaded_model.clone().unwrap_or_default()
         } else {
             String::new()
@@ -2545,24 +2595,21 @@ impl MiniMlxApp {
             .border_r_1()
             .border_color(rgb(BORDER))
             .child(
-                div()
-                    .px_2()
-                    .mb_4()
-                    .child(
-                        div()
-                            .id("installed-model-list")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(img("brand/AppIcon.png").size(px(28.0)))
-                            .child(
-                                div()
-                                    .text_size(px(18.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(TEXT))
-                                    .child("MiniMLX"),
-                            ),
-                    )
+                div().px_2().mb_4().child(
+                    div()
+                        .id("installed-model-list")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(img("brand/AppIcon.png").size(px(28.0)))
+                        .child(
+                            div()
+                                .text_size(px(18.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(TEXT))
+                                .child("MiniMLX"),
+                        ),
+                ),
             )
             .child(SidebarMenu::new().children([
                 self.nav_item(Page::Overview, cx),
@@ -2662,14 +2709,28 @@ impl MiniMlxApp {
             )
     }
 
+    fn copyable_model_api_id(&self, path: &str) -> String {
+        if self.api_running {
+            if let Ok(backend) = self.backend.try_lock() {
+                if let Some(id) = backend.running_model_api_id(path) {
+                    return id;
+                }
+            }
+        }
+        let alias = model_inference_options_for_path(&self.settings, path)
+            .and_then(|options| options.alias.as_deref());
+        crate::backend::model_api_id(Path::new(path), alias)
+    }
+
     fn status_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let loaded_model = self.loaded_model.clone();
         let model_label = loaded_model
             .as_deref()
-            .and_then(|path| Path::new(path).file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("No model loaded");
-        let model_label = tr(&self.settings.language, model_label);
+            .map(|path| model_display_name(Path::new(path)))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "No model loaded".to_string());
+        let copy_model_path = loaded_model.filter(|path| !path.is_empty());
+        let model_label = tr(&self.settings.language, &model_label);
         div()
             .flex()
             .items_center()
@@ -2756,7 +2817,18 @@ impl MiniMlxApp {
                                     .text_color(rgb(TEXT))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(model_label),
-                            ),
+                            )
+                            .when_some(copy_model_path, |row, path| {
+                                row.child(
+                                    app_button("copy-active-model-name")
+                                        .icon(gpui_component::Icon::new(gpui_component::IconName::Copy))
+                                        .tooltip(tr(&self.settings.language, "Copy model name"))
+                                        .ghost()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(this.copyable_model_api_id(&path)));
+                                        })),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -2784,11 +2856,7 @@ impl MiniMlxApp {
     }
 
     fn resource_panel(&self) -> impl IntoElement {
-        let gpu_utilization = self
-            .gpu_telemetry
-            .lock()
-            .ok()
-            .and_then(|value| *value);
+        let gpu_utilization = self.gpu_telemetry.lock().ok().and_then(|value| *value);
         let gpu_utilization_label = gpu_utilization
             .map(|value| format!("{value:.0}%"))
             .unwrap_or_else(|| tr(&self.settings.language, "Unavailable"));
@@ -3180,9 +3248,7 @@ impl MiniMlxApp {
         let loaded = self.loaded_model.clone();
         let name = loaded
             .as_deref()
-            .and_then(|path| Path::new(path).file_name())
-            .and_then(|value| value.to_str())
-            .map(str::to_string);
+            .map(|path| model_display_name(Path::new(path)));
         let size = loaded
             .as_deref()
             .and_then(|path| {
@@ -3268,18 +3334,23 @@ impl MiniMlxApp {
                     .text_color(rgb(if self.api_running { OLIVE } else { SECONDARY }))
                     .child(tr_operation(&self.settings.language, &status)),
             )
-            .child(div().w(px(190.0)).flex_shrink_0().flex().items_center().gap_2().when_some(
-                loaded,
-                |this, path| {
-                    let benchmark_path = path.clone();
-                    this.child(benchmark_model_button(
-                        benchmark_path,
-                        &self.settings.language,
-                        cx,
-                    ))
-                    .child(self.unload_loaded_model_button(path, cx))
-                },
-            ))
+            .child(
+                div()
+                    .w(px(190.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when_some(loaded, |this, path| {
+                        let benchmark_path = path.clone();
+                        this.child(benchmark_model_button(
+                            benchmark_path,
+                            &self.settings.language,
+                            cx,
+                        ))
+                        .child(self.unload_loaded_model_button(path, cx))
+                    }),
+            )
     }
 
     fn unload_loaded_model_button(
@@ -3444,9 +3515,8 @@ impl MiniMlxApp {
                 let duration = request["duration_ms"].as_f64().unwrap_or(0.0) / 1000.0;
                 let model = request["model"]
                     .as_str()
-                    .and_then(|path| Path::new(path).file_name())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Inference request");
+                    .map(|path| model_display_name(Path::new(path)))
+                    .unwrap_or_else(|| "Inference request".to_string());
                 let age = request["timestamp"]
                     .as_u64()
                     .map(format_relative_time)
@@ -3666,9 +3736,9 @@ impl MiniMlxApp {
                             .ghost()
                             .tooltip(tr(&self.settings.language, "Copy model name"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    this.model_config_name.clone(),
-                                ));
+                                if let Some(path) = this.model_config_path.as_deref() {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(this.copyable_model_api_id(path)));
+                                }
                             })),
                     )
                     .child(div().flex_1()),
@@ -3956,10 +4026,10 @@ impl MiniMlxApp {
                                 .tooltip(tr(&self.settings.language, "Copy model name"))
                                 .ghost()
                                 .on_click(cx.listener({
-                                    let model_name = model.name.clone();
-                                    move |_, _, _, cx| {
+                                    let model_path = model.path.clone();
+                                    move |this, _, _, cx| {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
-                                            model_name.clone(),
+                                            this.copyable_model_api_id(&model_path),
                                         ));
                                     }
                                 })),
@@ -4306,8 +4376,51 @@ impl MiniMlxApp {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.confirm_delete_model(&delete_path, &delete_name, window, cx);
             }));
+        let supports_ssd = std::fs::read_to_string(Path::new(&entry.path).join("config.json"))
+            .ok().and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|config| crate::backend::supports_ssd_paging_config(&config));
+        let ssd_ready = Path::new(&entry.path)
+            .join(".minimlx-ssd/.minimlx-ssd-manifest.json")
+            .is_file();
+        let prepare_path = entry.path.clone();
+        let prepare_backend = self.backend.clone();
+        let prepare = app_button("prepare-ssd-model")
+            .label(tr(
+                &self.settings.language,
+                if ssd_ready {
+                    "SSD paging ready"
+                } else {
+                    "Prepare SSD paging"
+                },
+            ))
+            .disabled(ssd_ready || is_loaded || self.operation.ends_with('…'))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.operation = "Preparing SSD paging…".into();
+                cx.notify();
+                let backend = prepare_backend.clone();
+                let path = prepare_path.clone();
+                let task = cx.background_executor().spawn(async move {
+                    backend
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .prepare_ssd_model(&path)
+                });
+                let entity = cx.entity().downgrade();
+                cx.spawn(async move |_, cx| {
+                    let result = task.await;
+                    let _ = entity.update(cx, |this, cx| {
+                        this.operation = match result {
+                            Ok(()) => "SSD paging ready".into(),
+                            Err(error) => format!("SSD paging preparation failed: {error}"),
+                        };
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }));
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .w_full()
             .gap_2()
@@ -4329,6 +4442,7 @@ impl MiniMlxApp {
                 )
             })
             .child(delete_button.when(!is_draft, |button| button.flex_1()))
+            .when(supports_ssd, |actions| actions.child(prepare))
     }
 
     fn open_model_settings(
@@ -4399,6 +4513,10 @@ impl MiniMlxApp {
                 .map(|value| value.to_string())
                 .unwrap_or_default();
             self.model_config_force_sampling = options.force_sampling.unwrap_or(false);
+            self.model_config_expert_cache_gb = options
+                .expert_cache_gb
+                .map(|v| v.to_string())
+                .unwrap_or_default();
             self.model_config_chat_template_kwargs = options
                 .chat_template_kwargs
                 .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
@@ -4658,6 +4776,18 @@ impl MiniMlxApp {
                             })
                         })
                         .transpose()?;
+                    let expert_cache_gb = parse("model-config-expert-cache")
+                        .map(|value| {
+                            value
+                                .parse::<f32>()
+                                .map_err(|_| "Expert cache must be a number in GB".to_string())
+                        })
+                        .transpose()?;
+                    if expert_cache_gb.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1024.0) {
+                        return Err(
+                            "Expert cache must be greater than 0 and at most 1024 GB".into()
+                        );
+                    }
                     let selected_draft = this.model_config_mtp_draft.as_str();
                     let mtp_draft_model = selected_draft
                         .strip_prefix("mtp::")
@@ -4731,6 +4861,7 @@ impl MiniMlxApp {
                         presence_penalty,
                         frequency_penalty,
                         force_sampling: this.model_config_force_sampling.then_some(true),
+                        expert_cache_gb,
                         chat_template_kwargs,
                         mtp_draft_model,
                         dflash_draft_model,
@@ -4823,6 +4954,7 @@ impl MiniMlxApp {
                     "model-config-min-p",
                     "model-config-presence-penalty",
                     "model-config-frequency-penalty",
+                    "model-config-expert-cache",
                     "model-config-chat-template-kwargs",
                 ] {
                     if let Some(input) = this.settings_text_inputs.get(id).cloned() {
@@ -4843,6 +4975,7 @@ impl MiniMlxApp {
                 this.model_config_min_p.clear();
                 this.model_config_presence_penalty.clear();
                 this.model_config_frequency_penalty.clear();
+                this.model_config_expert_cache_gb.clear();
                 this.model_config_force_sampling = false;
                 this.model_config_chat_template_kwargs.clear();
                 this.model_config_mtp_draft.clear();
@@ -4969,6 +5102,9 @@ impl MiniMlxApp {
                 .flex()
                 .flex_col()
                 .gap_4()
+                .child(model_configuration_panel(vec![
+                    self.model_settings_row("Expert cache (GB)", "model-config-expert-cache", "Leave blank to use the model's default. Applies to SSD expert offload after reload.", cx).into_any_element(),
+                ]))
                 .child(model_configuration_panel(vec![
                     model_configuration_heading(
                         &self.settings.language,
@@ -5871,20 +6007,25 @@ impl MiniMlxApp {
                                                 .label(tr(
                                                     &self.settings.language,
                                                     match self.model_search_sort_direction {
-                                                        ModelSearchSortDirection::Ascending => "Ascending",
-                                                        ModelSearchSortDirection::Descending => "Descending",
+                                                        ModelSearchSortDirection::Ascending => {
+                                                            "Ascending"
+                                                        }
+                                                        ModelSearchSortDirection::Descending => {
+                                                            "Descending"
+                                                        }
                                                     },
                                                 ))
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.model_search_sort_direction =
-                                                        match this.model_search_sort_direction {
-                                                            ModelSearchSortDirection::Ascending => {
-                                                                ModelSearchSortDirection::Descending
-                                                            }
-                                                            ModelSearchSortDirection::Descending => {
-                                                                ModelSearchSortDirection::Ascending
-                                                            }
-                                                        };
+                                                    this.model_search_sort_direction = match this
+                                                        .model_search_sort_direction
+                                                    {
+                                                        ModelSearchSortDirection::Ascending => {
+                                                            ModelSearchSortDirection::Descending
+                                                        }
+                                                        ModelSearchSortDirection::Descending => {
+                                                            ModelSearchSortDirection::Ascending
+                                                        }
+                                                    };
                                                     sort_model_search_results(
                                                         &mut this.model_search_results,
                                                         this.model_search_sort,
@@ -6727,6 +6868,8 @@ impl MiniMlxApp {
                                     .text_color(rgb(MUTED))
                                     .child(if let Some(draft) = configured_mtp_draft.as_ref() {
                                         format!("{} · {draft}", tr(&self.settings.language, "Speculative draft configured"))
+                                    } else if has_embedded_qwen4_mtp(&self.selected_model) {
+                                        tr(&self.settings.language, "Built-in MTP will be enabled automatically")
                                     } else {
                                         tr(&self.settings.language, "Speculative decoding is not configured for this model")
                                     }),
@@ -7349,35 +7492,34 @@ impl MiniMlxApp {
                     .border_t_1()
                     .border_color(rgb(BORDER))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(15.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(TEXT))
-                                            .child(tr(&self.settings.language, "API management")),
-                                    )
-                                    .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(
-                                        tr(&self.settings.language, "Network access is configured in Network settings"),
-                                    )),
-                            ),
-                            )
+                        div().flex().items_center().justify_between().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(tr(&self.settings.language, "API management")),
+                                )
+                                .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(tr(
+                                    &self.settings.language,
+                                    "Network access is configured in Network settings",
+                                ))),
+                        ),
+                    )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .justify_between()
                             .child(
-                                div().text_size(px(13.0)).text_color(rgb(MUTED)).child(
-                                    format!(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(format!(
                                         "{} · {}",
                                         if self.settings.bind_lan {
                                             tr(&self.settings.language, "Local network access")
@@ -7387,10 +7529,12 @@ impl MiniMlxApp {
                                         if self.settings.auth_enabled {
                                             tr(&self.settings.language, "API-key authentication on")
                                         } else {
-                                            tr(&self.settings.language, "API-key authentication off")
+                                            tr(
+                                                &self.settings.language,
+                                                "API-key authentication off",
+                                            )
                                         },
-                                    ),
-                                ),
+                                    )),
                             )
                             .child(
                                 div()
@@ -7448,15 +7592,10 @@ impl MiniMlxApp {
                             .child(tr(&self.settings.language, "Base URL")),
                     )
                     .when(self.settings.bind_lan && host.is_some(), |label| {
-                        label.child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(rgb(MUTED))
-                                .child(tr(
-                                    &self.settings.language,
-                                    "Use this address from another device on the same network",
-                                )),
-                        )
+                        label.child(div().text_size(px(12.0)).text_color(rgb(MUTED)).child(tr(
+                            &self.settings.language,
+                            "Use this address from another device on the same network",
+                        )))
                     }),
             )
             .child(
@@ -7495,8 +7634,7 @@ impl MiniMlxApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let host = api_connection_host(self.settings.bind_lan);
-        let endpoint = host
-            .map(|host| format!("http://{host}:{}{route}", self.settings_port));
+        let endpoint = host.map(|host| format!("http://{host}:{}{route}", self.settings_port));
         let copy_text = endpoint.clone();
         div()
             .flex()
@@ -7653,6 +7791,12 @@ impl MiniMlxApp {
                                                 .selected_value()
                                                 .cloned()
                                             else {
+                                                let _ = start_entity.update(cx, |this, cx| {
+                                                    this.operation =
+                                                        "Select a model before starting the service"
+                                                            .into();
+                                                    cx.notify();
+                                                });
                                                 return;
                                             };
                                             let _ = start_entity.update(cx, |this, cx| {
@@ -7765,6 +7909,9 @@ impl MiniMlxApp {
                     return;
                 }
                 if starting && model_path.is_empty() {
+                    this.operation = "Choose a model to start the service".into();
+                    this.sync_menubar();
+                    cx.notify();
                     this.open_api_model_picker(window, cx);
                     return;
                 }
@@ -7895,7 +8042,17 @@ impl MiniMlxApp {
                             .child(div().h(px(12.0)))
                             .children(filtered.into_iter().map(|category| {
                                 self.settings_category_button(category, cx)
-                            })),
+                            }))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_2()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0x2563EB))
+                                    .child(format!("{} {}", tr(&self.settings.language, "Version:"), env!("CARGO_PKG_VERSION"))),
+                            ),
                     )
                     .child(
                         div()
@@ -8234,15 +8391,12 @@ impl MiniMlxApp {
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
             .child(
-                TextInput::new(&input)
-                    .w_full()
-                    .appearance(false)
-                    .prefix(
-                        gpui_component::Icon::default()
-                            .path("icons/search.svg")
-                            .with_size(gpui_component::Size::Small)
-                            .text_color(rgb(MUTED)),
-                    ),
+                TextInput::new(&input).w_full().appearance(false).prefix(
+                    gpui_component::Icon::default()
+                        .path("icons/search.svg")
+                        .with_size(gpui_component::Size::Small)
+                        .text_color(rgb(MUTED)),
+                ),
             )
     }
 
@@ -8254,10 +8408,7 @@ impl MiniMlxApp {
         let selected = self.settings_category == category;
         let title = category.title(&self.settings.language);
         div()
-            .id(SharedString::from(format!(
-                "settings-category-{}",
-                title
-            )))
+            .id(SharedString::from(format!("settings-category-{}", title)))
             .w_full()
             .h(px(44.0))
             .flex()
@@ -8279,7 +8430,11 @@ impl MiniMlxApp {
             .child(
                 div()
                     .text_size(px(14.0))
-                    .font_weight(if selected { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
                     .child(title),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -8307,16 +8462,13 @@ impl MiniMlxApp {
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT))
-                            .child(tr(&self.settings.language, label)),
-                    ),
+                div().flex().flex_col().child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT))
+                        .child(tr(&self.settings.language, label)),
+                ),
             )
             .child(
                 self.settings_text_control(&field_id, cx)
@@ -8342,21 +8494,13 @@ impl MiniMlxApp {
                     .text_color(rgb(TEXT))
                     .child(tr(&self.settings.language, "Listen address")),
             )
+            .child(div().flex_1().min_w(px(0.0)).h(px(1.0)))
             .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h(px(1.0)),
-            )
-            .child(
-                div()
-                    .w(px(280.0))
-                    .flex_shrink_0()
-                    .child(
-                        Dropdown::new(&self.listen_address_dropdown)
-                            .w_full()
-                            .with_size(px(13.0)),
-                    ),
+                div().w(px(280.0)).flex_shrink_0().child(
+                    Dropdown::new(&self.listen_address_dropdown)
+                        .w_full()
+                        .with_size(px(13.0)),
+                ),
             )
     }
 
@@ -8381,10 +8525,25 @@ impl MiniMlxApp {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_size(px(14.0)).font_weight(FontWeight::MEDIUM).text_color(rgb(TEXT)).child(tr(&self.settings.language, label)))
-                    .child(div().text_size(px(12.0)).text_color(rgb(MUTED)).child(tr(&self.settings.language, detail))),
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(TEXT))
+                            .child(tr(&self.settings.language, label)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(MUTED))
+                            .child(tr(&self.settings.language, detail)),
+                    ),
             )
-            .child(self.settings_text_control(field_id, cx).flex_1().max_w(px(690.0)))
+            .child(
+                self.settings_text_control(field_id, cx)
+                    .flex_1()
+                    .max_w(px(690.0)),
+            )
     }
 
     fn settings_download_text_row(
@@ -8503,16 +8662,13 @@ impl MiniMlxApp {
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(TEXT))
-                            .child(tr(&self.settings.language, label)),
-                    ),
+                div().flex().flex_col().child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT))
+                        .child(tr(&self.settings.language, label)),
+                ),
             )
             .child(
                 Switch::new(SharedString::from(format!("toggle-{label}")))
@@ -8645,7 +8801,13 @@ impl MiniMlxApp {
             .py_2()
             .border_b_1()
             .border_color(rgb(BORDER))
-            .child(div().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).text_color(rgb(TEXT)).child(tr(&self.settings.language, "API key")))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(TEXT))
+                    .child(tr(&self.settings.language, "API key")),
+            )
             .child(controls)
     }
 
@@ -8676,8 +8838,8 @@ impl MiniMlxApp {
                         app_button("refresh-logs")
                             .label(tr(&self.settings.language, "Refresh logs"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                let path = PathBuf::from(&this.settings.data_path)
-                                    .join("logs/server.log");
+                                let path =
+                                    PathBuf::from(&this.settings.data_path).join("logs/server.log");
                                 let value = read_log_contents(&path);
                                 this.log_input.update(cx, |input, cx| {
                                     input.set_value(value, window, cx);
@@ -8854,7 +9016,10 @@ impl MiniMlxApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(self.settings_text_control("settings-data-path", cx).flex_1())
+                    .child(
+                        self.settings_text_control("settings-data-path", cx)
+                            .flex_1(),
+                    )
                     .child(picker),
             )
     }
@@ -8924,37 +9089,75 @@ impl MiniMlxApp {
                 content = content
                     .child(settings_panel(vec![
                         self.settings_listen_address_row(cx).into_any_element(),
-                        self.settings_number_row("Port", &self.settings_port, NumericSetting::Port, "Default 18765 · service restarts when applied", cx).into_any_element(),
+                        self.settings_number_row(
+                            "Port",
+                            &self.settings_port,
+                            NumericSetting::Port,
+                            "Default 18765 · service restarts when applied",
+                            cx,
+                        )
+                        .into_any_element(),
                         self.settings_endpoint_row(
                             "Hugging Face endpoint",
                             "Used for Hugging Face model search and downloads.",
                             "setting-huggingface-endpoint",
                             cx,
-                        ).into_any_element(),
+                        )
+                        .into_any_element(),
                         self.settings_endpoint_row(
                             "ModelScope endpoint",
                             "Used for ModelScope model search and downloads.",
                             "setting-modelscope-endpoint",
                             cx,
-                        ).into_any_element(),
+                        )
+                        .into_any_element(),
                     ]))
                     .child(settings_panel(vec![
                         settings_group_heading(&self.settings.language, "Proxy"),
-                        self.settings_download_text_row("HTTP proxy", "", DownloadTextSetting::HttpProxy, cx).into_any_element(),
-                        self.settings_download_text_row("HTTPS proxy", "", DownloadTextSetting::HttpsProxy, cx).into_any_element(),
-                        self.settings_download_text_row("No proxy", "Separate multiple hosts or IP addresses with commas.", DownloadTextSetting::NoProxy, cx).into_any_element(),
+                        self.settings_download_text_row(
+                            "HTTP proxy",
+                            "",
+                            DownloadTextSetting::HttpProxy,
+                            cx,
+                        )
+                        .into_any_element(),
+                        self.settings_download_text_row(
+                            "HTTPS proxy",
+                            "",
+                            DownloadTextSetting::HttpsProxy,
+                            cx,
+                        )
+                        .into_any_element(),
+                        self.settings_download_text_row(
+                            "No proxy",
+                            "Separate multiple hosts or IP addresses with commas.",
+                            DownloadTextSetting::NoProxy,
+                            cx,
+                        )
+                        .into_any_element(),
                     ]))
                     .child(settings_panel(vec![
                         settings_group_heading(&self.settings.language, "TLS"),
-                        self.settings_download_text_row("CA bundle", "Path to a custom root CA certificate bundle.", DownloadTextSetting::CaBundle, cx).into_any_element(),
+                        self.settings_download_text_row(
+                            "CA bundle",
+                            "Path to a custom root CA certificate bundle.",
+                            DownloadTextSetting::CaBundle,
+                            cx,
+                        )
+                        .into_any_element(),
                     ]));
             }
             SettingsCategory::Security => {
-                content = content
-                    .child(settings_panel(vec![
-                        self.settings_boolean_row("API key authentication", "Require Bearer token or x-api-key for API requests", BooleanSetting::Authentication, cx).into_any_element(),
-                        self.settings_api_key_row(cx).into_any_element(),
-                    ]));
+                content = content.child(settings_panel(vec![
+                    self.settings_boolean_row(
+                        "API key authentication",
+                        "Require Bearer token or x-api-key for API requests",
+                        BooleanSetting::Authentication,
+                        cx,
+                    )
+                    .into_any_element(),
+                    self.settings_api_key_row(cx).into_any_element(),
+                ]));
             }
             SettingsCategory::Inference => {
                 content = content.child(settings_panel(vec![
@@ -9066,24 +9269,27 @@ impl MiniMlxApp {
                     rows.push(row.into_any_element());
                 }
                 content = content
-                    .child(Self::section_title(&tr(&self.settings.language, "MiniMLX model library"), None))
+                    .child(Self::section_title(
+                        &tr(&self.settings.language, "MiniMLX model library"),
+                        None,
+                    ))
                     .child(settings_panel(rows))
-                    .child(Self::section_title(&tr(&self.settings.language, "External model folders"), None))
+                    .child(Self::section_title(
+                        &tr(&self.settings.language, "External model folders"),
+                        None,
+                    ))
                     .child(self.settings_directory_input(cx));
             }
             SettingsCategory::Logs => {
-                content = content
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .child(self.settings_log_viewer(cx)),
-                    );
+                content = content.flex_1().min_h(px(0.0)).child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .child(self.settings_log_viewer(cx)),
+                );
             }
         }
         content.into_any_element()
@@ -9718,11 +9924,14 @@ pub fn run(model_dir: String, root: PathBuf, python: PathBuf) {
                                             else {
                                                 continue;
                                             };
-                                            let _ = cx.update_window(window_handle, |_, window, cx| {
-                                                let _ = entity.update(cx, |this, cx| {
-                                                    this.set_service_from_menu(starting, window, cx);
+                                            let _ =
+                                                cx.update_window(window_handle, |_, window, cx| {
+                                                    let _ = entity.update(cx, |this, cx| {
+                                                        this.set_service_from_menu(
+                                                            starting, window, cx,
+                                                        );
+                                                    });
                                                 });
-                                            });
                                         }
                                     }
                                     menubar::MenuAction::Quit => {
@@ -9740,6 +9949,11 @@ pub fn run(model_dir: String, root: PathBuf, python: PathBuf) {
         )
         .expect("failed to open MiniMLX window");
         #[cfg(target_os = "macos")]
+        // The first call happens before the GPUI window is created. Reapply it
+        // after launch as well so the Dock tile gets the bundled artwork when
+        // the app switches to the regular activation policy.
+        set_application_icon();
+        #[cfg(target_os = "macos")]
         if let Some(entity) = app_entity.borrow().clone() {
             let hide_on_launch = entity.read(cx).settings.hide_window_on_launch;
             if hide_on_launch {
@@ -9747,8 +9961,8 @@ pub fn run(model_dir: String, root: PathBuf, python: PathBuf) {
                 let labels = entity.read(cx).menubar_labels();
                 menubar::set_window_hidden(true, &labels);
             } else {
-                set_regular_activation_policy();
                 cx.activate(true);
+                set_regular_activation_policy();
                 let labels = entity.read(cx).menubar_labels();
                 menubar::set_window_hidden(false, &labels);
             }
@@ -9774,6 +9988,13 @@ fn set_application_icon() {
         let image = NSImage::alloc(nil).initWithData_(data);
         if image != nil {
             NSApp().setApplicationIconImage_(image);
+            // A process launched directly by Cargo/RustRover may already
+            // have a Dock tile backed by the generic executable icon. Force
+            // that tile to redraw after replacing the application image.
+            let dock_tile: id = msg_send![NSApp(), dockTile];
+            if dock_tile != nil {
+                let _: () = msg_send![dock_tile, display];
+            }
         }
     }
 }

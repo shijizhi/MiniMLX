@@ -385,11 +385,17 @@ def _finish_reason(request: InferenceRequest, completion_tokens: int) -> str:
     return "stop"
 
 
+def _public_model_path(runtime: Runtime) -> Path:
+    path = Path(getattr(getattr(runtime, "descriptor", None), "model_dir", "minimlx")).expanduser()
+    if path.name == ".minimlx-ssd" and (path / "offload_index.json").is_file():
+        return path.parent
+    return path
+
+
 def _model_id(runtime: Runtime, alias: str | None = None) -> str:
     if alias:
         return alias
-    model_dir = getattr(getattr(runtime, "descriptor", None), "model_dir", "minimlx")
-    path = Path(model_dir).expanduser()
+    path = _public_model_path(runtime)
 
     # Match oMLX's public model ID: use the model's directory leaf (or an
     # explicit alias), not the publisher-prefixed flattened download folder.
@@ -415,7 +421,7 @@ def _is_requested_model(runtime: Runtime, requested: Any, model_id: str, alias: 
     if not isinstance(requested, str) or not requested.strip():
         return False
     requested = requested.strip().casefold()
-    path = Path(getattr(getattr(runtime, "descriptor", None), "model_dir", ""))
+    path = _public_model_path(runtime)
     candidates = {model_id.casefold(), path.name.casefold()}
     if alias:
         candidates.add(alias.casefold())
@@ -607,7 +613,9 @@ def serve_http(
         logger.info("%s", " ".join(fields))
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "MiniMLX/0.1"
+        from minimlx_runtime._version import __version__
+
+        server_version = f"MiniMLX/{__version__}"
 
         def log_message(self, _format: str, *args: object) -> None:
             # Health, telemetry, metrics, and model-list polling are internal

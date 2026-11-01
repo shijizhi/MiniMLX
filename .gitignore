@@ -3,10 +3,15 @@
 .build/
 .swiftpm/
 target/
+dist/
 native/**/build/
 
 # Machine-local runtime settings
 config/minimlx.local.json
+.idea/
+
+# Generated benchmark output
+Reports/Performance/*.md
 
 # Python caches
 __pycache__/

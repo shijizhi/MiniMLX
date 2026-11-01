@@ -21,6 +21,46 @@ const MEMORY_HEADROOM_PERCENT: u64 = 2;
 const MODEL_WEIGHT_OVERHEAD_NUMERATOR: u64 = 5;
 const MODEL_WEIGHT_OVERHEAD_DENOMINATOR: u64 = 4;
 
+// Keep the machine awake only while a download is active. `-i` prevents
+// idle system sleep without keeping the display on; `-w` also releases the
+// assertion if MiniMLX terminates unexpectedly.
+struct DownloadSleepGuard {
+    #[cfg(target_os = "macos")]
+    child: Child,
+}
+
+impl DownloadSleepGuard {
+    fn acquire() -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let child = Command::new("/usr/bin/caffeinate")
+                .args(["-i", "-w", &std::process::id().to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| {
+                    format!("Could not prevent idle sleep during download: {error}")
+                })?;
+            Ok(Self { child })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for DownloadSleepGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn system_physical_memory_bytes() -> u64 {
     let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
@@ -60,6 +100,7 @@ pub struct ModelInferenceOptions {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub force_sampling: Option<bool>,
+    pub expert_cache_gb: Option<f32>,
     pub chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     /// Optional Qwen MTP drafter checkpoint attached to this target model.
     pub mtp_draft_model: Option<String>,
@@ -763,6 +804,70 @@ fn parse_content_range_start(value: &str) -> Option<u64> {
 }
 
 impl Backend {
+    pub(crate) fn running_model_api_id(&self, path: &str) -> Option<String> {
+        if self.api_process.is_none() || !self.last_api_model_path.as_deref()
+            .is_some_and(|running| same_filesystem_path(running, path)) {
+            return None;
+        }
+        Some(model_api_id(Path::new(path), self.last_api_model_options.as_ref()
+            .and_then(|options| options.alias.as_deref())))
+    }
+
+    pub fn prepare_ssd_model(&self, model_path: &str) -> Result<(), String> {
+        if !self.is_listed_model_path(model_path) {
+            return Err("Model is not in the model library".into());
+        }
+        let output = Command::new(&self.python)
+            .current_dir(&self.root)
+            .env("PYTHONPATH", self.root.join("python"))
+            .args(["-m", "minimlx_runtime.prepare_offload", model_path])
+            .output()
+            .map_err(|e| format!("Could not start SSD preparation: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "SSD preparation failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    fn execution_model_path(
+        &self,
+        model_path: &str,
+        options: Option<&ModelInferenceOptions>,
+        context: Option<u32>,
+        replaces_loaded_model: bool,
+    ) -> Result<String, String> {
+        let source = Path::new(model_path);
+        let full_memory_error =
+            match self.ensure_memory_budget(model_path, options, context, replaces_loaded_model) {
+                Ok(()) => return Ok(model_path.to_string()),
+                Err(error) => error,
+            };
+        let config = fs::read_to_string(source.join("config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let supports_paging = config.as_ref().is_some_and(supports_ssd_paging_config);
+        if !supports_paging {
+            return Err(full_memory_error);
+        }
+        let copy = source.join(".minimlx-ssd");
+        if fs::symlink_metadata(&copy).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err("SSD copy must not be a symbolic link".into());
+        }
+        if !copy.exists() {
+            self.prepare_ssd_model(model_path).map_err(|error| format!("Full model cannot fit in memory: {full_memory_error}\nSSD paging preparation failed: {error}"))?;
+        }
+        if !is_model_dir(&copy) || !copy.join(".minimlx-ssd-manifest.json").is_file() {
+            return Err("SSD paging copy is incomplete; it cannot be used for loading.".into());
+        }
+        let copy_path = copy.to_string_lossy().into_owned();
+        self.ensure_memory_budget(&copy_path, options, context, replaces_loaded_model)
+            .map_err(|error| format!("SSD paging also cannot fit in available memory: {error}"))?;
+        Ok(copy_path)
+    }
     pub fn fetch_model_card(
         context: &DownloadContext,
         repo_id: &str,
@@ -969,7 +1074,7 @@ impl Backend {
     }
 
     pub fn latest_report(&self) -> (usize, String) {
-        let directory = self.root.join("Reports/Performance");
+        let directory = self.report_directory();
         let mut reports: Vec<_> = fs::read_dir(directory)
             .into_iter()
             .flatten()
@@ -991,7 +1096,11 @@ impl Backend {
     }
 
     pub fn report_directory(&self) -> PathBuf {
-        self.root.join("Reports/Performance")
+        if self.root.join("runtime/bin/python3").is_file() {
+            std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".minimlx/Reports/Performance")
+        } else {
+            self.root.join("Reports/Performance")
+        }
     }
 
     pub fn download_context(&self) -> DownloadContext {
@@ -1255,7 +1364,7 @@ impl Backend {
                 Path::new(path).display()
             ));
         }
-        self.ensure_memory_budget(path, model_options, None, false)?;
+        let execution_path = self.execution_model_path(path, model_options, None, false)?;
         // A failed health check does not mean the child process is gone. Stop
         // any tracked API child before switching to the in-process worker.
         if self.api_process.is_some() {
@@ -1269,7 +1378,7 @@ impl Backend {
         if let Some(worker) = self.worker.as_ref() {
             return match worker
                 .request(&Request::Load {
-                    model_dir: path.to_string(),
+                    model_dir: execution_path.clone(),
                 })
                 .map_err(|e| e.to_string())?
                 .payload
@@ -1288,17 +1397,26 @@ impl Backend {
         let dflash_draft = model_options
             .and_then(|options| options.dflash_draft_model.as_deref())
             .unwrap_or("");
-        let force_text = if mtp_draft.is_empty() && dflash_draft.is_empty() { "0" } else { "1" };
+        let expert_cache = model_options
+            .and_then(|o| o.expert_cache_gb)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let force_text = if mtp_draft.is_empty() && dflash_draft.is_empty() {
+            "0"
+        } else {
+            "1"
+        };
         self.worker = Some(
             PythonWorker::start_with_env(
                 &self.python,
                 &self.root,
-                path,
+                &execution_path,
                 &self.socket_path,
                 &[
                     ("MINIMLX_MTP_DRAFT_MODEL", mtp_draft),
                     ("MINIMLX_DFLASH_DRAFT_MODEL", dflash_draft),
                     ("MINIMLX_FORCE_TEXT_RUNTIME", force_text),
+                    ("MINIMLX_EXPERT_CACHE_GB", &expert_cache),
                 ],
             )
             .map_err(|e| e.to_string())?,
@@ -1340,8 +1458,14 @@ impl Backend {
         model_options: Option<&ModelInferenceOptions>,
         benchmark_options: &ContextBenchmarkOptions,
     ) -> Result<String, String> {
-        let max_context = benchmark_options.contexts.iter().copied().max().unwrap_or(0) as u32;
-        self.ensure_memory_budget(model_path, model_options, Some(max_context), false)?;
+        let max_context = benchmark_options
+            .contexts
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0) as u32;
+        let execution_path =
+            self.execution_model_path(model_path, model_options, Some(max_context), false)?;
         let restore_api = self.api_running();
         let restore_model = self.loaded_model.clone();
         let restore_worker_options = self.last_worker_model_options.clone();
@@ -1351,7 +1475,7 @@ impl Backend {
         self.worker.take();
         self.loaded_model = None;
         let result =
-            self.run_context_benchmark_isolated(model_path, model_options, benchmark_options);
+            self.run_context_benchmark_isolated(&execution_path, model_options, benchmark_options);
         let restore_result = if restore_api {
             restore_model
                 .as_deref()
@@ -1397,9 +1521,13 @@ impl Backend {
             "novel_ja" => "novel_ja.txt",
             _ => return Err("请选择有效的测试语料".into()),
         };
-        let prompt = self.root.join("Resources/BenchmarkCorpus").join(corpus_file);
+        let prompt = self
+            .root
+            .join("Resources/BenchmarkCorpus")
+            .join(corpus_file);
         let mtp_draft_model = model_options.and_then(|options| options.mtp_draft_model.as_deref());
-        let dflash_draft_model = model_options.and_then(|options| options.dflash_draft_model.as_deref());
+        let dflash_draft_model =
+            model_options.and_then(|options| options.dflash_draft_model.as_deref());
         let mtp_report = mtp_draft_model
             .map(|path| {
                 Path::new(path)
@@ -1410,12 +1538,25 @@ impl Backend {
             })
             .unwrap_or_else(|| "disabled".into());
         let dflash_report = dflash_draft_model
-            .map(|path| Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path).to_string())
+            .map(|path| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(path)
+                    .to_string()
+            })
             .unwrap_or_else(|| "disabled".into());
         let mut command = Command::new(&self.python);
         command
             .current_dir(&self.root)
             .env("PYTHONPATH", self.root.join("python"))
+            .env(
+                "MINIMLX_EXPERT_CACHE_GB",
+                model_options
+                    .and_then(|o| o.expert_cache_gb)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
             .env("MINIMLX_SUPERVISOR_PID", std::process::id().to_string())
             .arg(self.root.join("tools/benchmark_context_matrix.py"))
             .arg(model_path)
@@ -1448,7 +1589,12 @@ impl Backend {
         if !output.status.success() {
             return Err(format!("{stderr}\n{stdout}"));
         }
-        let reports = self.root.join("Reports/Performance");
+        let mtp_report = if mtp_draft_model.is_none() && stdout.contains("decode backend (MTP)") {
+            "embedded".to_string()
+        } else {
+            mtp_report
+        };
+        let reports = self.report_directory();
         fs::create_dir_all(&reports).map_err(|e| e.to_string())?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1565,6 +1711,7 @@ impl Backend {
         if !matches!(source, "huggingface" | "modelscope") {
             return Err(format!("unsupported model hub: {source}"));
         }
+        let _sleep_guard = DownloadSleepGuard::acquire()?;
         let destination = context.download_directory.join(repo_id.replace('/', "--"));
         fs::create_dir_all(&destination).map_err(|error| {
             format!(
@@ -1666,7 +1813,22 @@ impl Backend {
             Some(context_tokens) => estimate_model_runtime_memory(path, context_tokens),
             None => estimate_model_weight_memory(path),
         };
+        let paged = Path::new(model_path).join("offload_index.json").is_file();
         let mut required = estimate(model_path);
+        let mut paging_working_memory = 0;
+        if paged {
+            let default_cache = fs::read_to_string(Path::new(model_path).join("config.json"))
+                .ok().and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.get("model_type").and_then(Value::as_str).map(str::to_owned))
+                .map_or(12.0, |kind| if kind == "qwen3_5_moe" { 2.0 } else { 12.0 });
+            let cache_gb = model_options
+                .and_then(|options| options.expert_cache_gb)
+                .unwrap_or(default_cache);
+            paging_working_memory = (cache_gb * 1_000_000_000.0) as u64;
+            paging_working_memory = paging_working_memory
+                .saturating_add(required.saturating_sub(estimate_model_weight_memory(model_path)));
+            required = required.saturating_add((cache_gb * 1_000_000_000.0) as u64);
+        }
         if let Some(options) = model_options {
             for draft_path in [
                 options.mtp_draft_model.as_deref(),
@@ -1700,8 +1862,8 @@ impl Backend {
                 .into_iter()
                 .flatten()
                 {
-                    releasable = releasable
-                        .saturating_add(estimate_model_weight_memory(draft_path));
+                    releasable =
+                        releasable.saturating_add(estimate_model_weight_memory(draft_path));
                 }
             }
             required = required.saturating_sub(releasable);
@@ -1714,7 +1876,17 @@ impl Backend {
         // Keep the oMLX aggressive-tier reserve (2%, 1.5–4 GiB) on top.
         let headroom = memory_headroom(total);
         let needed = required.saturating_add(headroom);
-        if available < needed {
+        // File-backed paged weights can be reclaimed and faulted back in by
+        // macOS. Requiring their entire estimated size to be free at once
+        // defeats paging. Still require enough total RAM for the conservative
+        // estimate and enough currently available RAM for cache and KV growth.
+        let paging_can_proceed = paged
+            && total >= needed
+            && available >= paging_working_memory.saturating_add(headroom)
+            && model_options.is_none_or(|options| {
+                options.mtp_draft_model.is_none() && options.dflash_draft_model.is_none()
+            });
+        if available < needed && !paging_can_proceed {
             return Err(format!(
                 "Model load blocked to protect unified memory: estimated additional use is {}, only {} is currently available, and {} is reserved for macOS. Choose a smaller model or context, or close other apps first.",
                 format_bytes(required),
@@ -1749,7 +1921,7 @@ impl Backend {
         if already_running {
             return Ok(());
         }
-        self.ensure_memory_budget(model_path, model_options, None, true)?;
+        let execution_path = self.execution_model_path(model_path, model_options, None, true)?;
         if self.configured_auth_required
             && self.configured_api_key.as_deref().is_none_or(str::is_empty)
         {
@@ -1802,7 +1974,8 @@ impl Backend {
             .transpose()
             .map_err(|error| format!("could not serialize chat template settings: {error}"))?;
         let mtp_draft_model = model_options.and_then(|options| options.mtp_draft_model.as_deref());
-        let dflash_draft_model = model_options.and_then(|options| options.dflash_draft_model.as_deref());
+        let dflash_draft_model =
+            model_options.and_then(|options| options.dflash_draft_model.as_deref());
         let run_log_path = self
             .configured_history_db
             .parent()
@@ -1811,13 +1984,20 @@ impl Backend {
         let mut child = Command::new(&self.python)
             .current_dir(&self.root)
             .env("PYTHONPATH", self.root.join("python"))
+            .env(
+                "MINIMLX_EXPERT_CACHE_GB",
+                model_options
+                    .and_then(|o| o.expert_cache_gb)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            )
             .env("MINIMLX_SUPERVISOR_PID", std::process::id().to_string())
             .env_remove("MINIMLX_MTP_DRAFT_MODEL")
             .env_remove("MINIMLX_DFLASH_DRAFT_MODEL")
             .arg("-m")
             .arg("minimlx_runtime")
             .arg("api")
-            .arg(model_path)
+            .arg(&execution_path)
             .args([
                 "--host",
                 &self.configured_host,
@@ -2067,7 +2247,13 @@ fn discover_model_directories(configured_roots: &[PathBuf]) -> Vec<PathBuf> {
             if let Ok(entries) = fs::read_dir(directory) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir() && !is_cache_path(&path) {
+                    if path.is_dir()
+                        && !is_cache_path(&path)
+                        && !path.file_name().is_some_and(|n| {
+                            n.to_string_lossy().starts_with(".minimlx-ssd")
+                                || n.to_string_lossy().starts_with(".minimlx-mtp")
+                        })
+                    {
                         candidates.push(path.clone());
                         next.push(path);
                     }
@@ -2181,7 +2367,9 @@ fn ensure_api_port_available(port: u16, app_root: &Path) -> Result<(), String> {
         let status = Command::new("/bin/kill")
             .args(["-KILL", &pid.to_string()])
             .status()
-            .map_err(|error| format!("could not force-stop the previous MiniMLX API process: {error}"))?;
+            .map_err(|error| {
+                format!("could not force-stop the previous MiniMLX API process: {error}")
+            })?;
         if !status.success() {
             return Err(format!(
                 "could not force-stop the previous MiniMLX API process (PID {pid})"
@@ -2202,14 +2390,11 @@ fn ensure_api_port_available(port: u16, app_root: &Path) -> Result<(), String> {
 
 fn listening_process_ids(port: u16) -> Result<Vec<u32>, String> {
     let output = Command::new("lsof")
-        .args([
-            "-nP",
-            "-t",
-            &format!("-iTCP:{port}"),
-            "-sTCP:LISTEN",
-        ])
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
         .output()
-        .map_err(|error| format!("could not identify the process using API port {port}: {error}"))?;
+        .map_err(|error| {
+            format!("could not identify the process using API port {port}: {error}")
+        })?;
     if !output.status.success() && output.stdout.is_empty() {
         return Ok(Vec::new());
     }
@@ -2345,6 +2530,72 @@ fn is_model_dir(path: &Path) -> bool {
 }
 
 fn complete_weight_files(path: &Path) -> bool {
+    let offload_index = path.join("offload_index.json");
+    if offload_index.is_file() {
+        let Some(manifest) = fs::read_to_string(path.join(".minimlx-ssd-manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        else {
+            return false;
+        };
+        let Some(expected) = manifest.get("resident").and_then(Value::as_array) else {
+            return false;
+        };
+        if expected.is_empty()
+            || !expected.iter().all(|v| {
+                v.as_str().is_some_and(|name| {
+                    name.starts_with("resident-")
+                        && name.ends_with(".safetensors")
+                        && !name.contains('/')
+                        && is_complete_safetensors(&path.join(name))
+                })
+            })
+        {
+            return false;
+        }
+        let Some(index) = fs::read_to_string(offload_index)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        else {
+            return false;
+        };
+        let Some(layers) = index.get("layers").and_then(Value::as_array) else {
+            return false;
+        };
+        if layers.is_empty()
+            || index
+                .get("num_experts")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        {
+            return false;
+        }
+        if !layers.iter().all(|layer| {
+            layer.as_u64().is_some_and(|n| {
+                is_complete_safetensors(
+                    &path
+                        .join("experts")
+                        .join(format!("layer_{n:04}.safetensors")),
+                )
+            })
+        }) {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(path) else {
+            return false;
+        };
+        let resident: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("resident-") && n.ends_with(".safetensors"))
+            })
+            .collect();
+        return !resident.is_empty() && resident.iter().all(|p| is_complete_safetensors(p));
+    }
     let index_path = path.join("model.safetensors.index.json");
     if index_path.exists() {
         let Ok(index) = fs::read_to_string(index_path) else {
@@ -2530,7 +2781,7 @@ fn is_complete_npz(path: &Path) -> bool {
         .any(|record| record.starts_with(b"PK\x05\x06"))
 }
 
-fn model_display_name(path: &Path) -> String {
+pub(crate) fn model_display_name(path: &Path) -> String {
     if let Ok(repo_id) = fs::read_to_string(path.join(".minimlx-repo-id")) {
         let repo_id = repo_id.trim();
         if validate_repo_id(repo_id).is_ok() {
@@ -2561,12 +2812,152 @@ fn model_display_name(path: &Path) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// Match the ID returned by the API's GET /v1/models endpoint.
+pub(crate) fn model_api_id(path: &Path, alias: Option<&str>) -> String {
+    if let Some(alias) = alias.filter(|alias| !alias.is_empty()) {
+        return alias.to_string();
+    }
+    if let Ok(repo_id) = fs::read_to_string(path.join(".minimlx-repo-id")) {
+        let repo_id = repo_id.trim();
+        if repo_id.contains('/') {
+            return repo_id.rsplit('/').next().unwrap_or(repo_id).to_string();
+        }
+    }
+    if path.parent().and_then(Path::file_name).is_some_and(|name| name == "snapshots") {
+        if let Some(repo) = path.parent().and_then(Path::parent).and_then(Path::file_name)
+            .and_then(|name| name.to_str()).and_then(|name| name.strip_prefix("models--")) {
+            return repo.split_once("--").map_or(repo, |(_, name)| name).to_string();
+        }
+    }
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("minimlx");
+    name.split_once("--").map_or(name, |(_, model)| model).to_string()
+}
+
+fn paged_external_ple_bytes(root: &Path) -> Option<u64> {
+    if std::env::var("MINIMLX_QWEN4_PLE_SSD").ok().as_deref() == Some("0") {
+        return None;
+    }
+    let config: Value = serde_json::from_slice(&fs::read(root.join("config.json")).ok()?).ok()?;
+    if config.get("model_type").and_then(Value::as_str) != Some("qwen4_exp") {
+        return None;
+    }
+    let source_index: Value = serde_json::from_slice(
+        &fs::read(root.parent()?.join("model.safetensors.index.json")).ok()?,
+    ).ok()?;
+    let marker = ".ple.ple_embedding.ngram_embedding.shards.";
+    let prefixes: std::collections::HashSet<_> = source_index.get("weight_map")?.as_object()?.keys()
+        .filter(|key| key.contains(marker))
+        .filter_map(|key| key.rsplit_once('.').map(|(prefix, _)| prefix))
+        .collect();
+    if prefixes.is_empty() {
+        return None;
+    }
+    let source_config: Value = serde_json::from_slice(&fs::read(root.parent()?.join("config.json")).ok()?).ok()?;
+    if source_config.get("model_type").and_then(Value::as_str) != Some("qwen4_exp") { return None; }
+    let quant = source_config.get("quantization_config")
+        .filter(|v| v.as_object().is_some_and(|obj| !obj.is_empty()))
+        .or_else(|| source_config.get("quantization"))?;
+    let mut layout = None;
+    if !prefixes.iter().all(|prefix| {
+        let params = quant.get(*prefix).unwrap_or(quant);
+        let current = (params.get("bits").and_then(Value::as_u64),
+                       params.get("group_size").and_then(Value::as_u64),
+                       params.get("mode").and_then(Value::as_str));
+        let valid = matches!(current, (Some(4), Some(32), Some("affine")) | (Some(4), Some(16), Some("nvfp4")));
+        let consistent = layout.is_none() || layout == Some(current);
+        layout = Some(current);
+        valid && consistent
+    }) { return None; }
+    let mut ple_bytes = 0u64;
+    let mut found = false;
+    for entry in fs::read_dir(root).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        if !name.starts_with("resident-") || !name.ends_with(".safetensors") {
+            continue;
+        }
+        let mut file = fs::File::open(entry.path()).ok()?;
+        let length = file.metadata().ok()?.len();
+        let mut prefix = [0u8; 8];
+        file.read_exact(&mut prefix).ok()?;
+        let header_len = u64::from_le_bytes(prefix);
+        if header_len == 0 || header_len > 100 * 1024 * 1024 || header_len.checked_add(8)? > length {
+            return None;
+        }
+        let mut header = vec![0; usize::try_from(header_len).ok()?];
+        file.read_exact(&mut header).ok()?;
+        let header: Value = serde_json::from_slice(&header).ok()?;
+        for (key, tensor) in header.as_object()? {
+            if !key.contains(marker) { continue; }
+            let offsets = tensor.get("data_offsets")?.as_array()?;
+            if offsets.len() != 2 { return None; }
+            let (start, end) = (offsets[0].as_u64()?, offsets[1].as_u64()?);
+            if end < start || end > length.checked_sub(header_len + 8)? { return None; }
+            ple_bytes = ple_bytes.checked_add(end - start)?;
+            found = true;
+        }
+    }
+    found.then_some(ple_bytes)
+}
+
+pub(crate) fn supports_ssd_paging_config(config: &Value) -> bool {
+    let kind = config.get("model_type").and_then(Value::as_str);
+    let text = config.get("text_config").unwrap_or(config);
+    kind == Some("qwen4_exp") || (kind == Some("qwen3_5_moe")
+        && text.get("num_experts").and_then(Value::as_u64) == Some(256)
+        && text.get("hidden_size").and_then(Value::as_u64) == Some(2048)
+        && text.get("num_hidden_layers").and_then(Value::as_u64) == Some(40))
+}
+
 fn estimate_model_weight_memory(model_path: &str) -> u64 {
     // MLX loads packed/quantized tensors close to their on-disk size. Allow
     // 25% for loader/runtime overhead instead of doubling every model's size.
-    directory_size(Path::new(model_path))
-        .saturating_mul(MODEL_WEIGHT_OVERHEAD_NUMERATOR)
-        / MODEL_WEIGHT_OVERHEAD_DENOMINATOR
+    let root = Path::new(model_path);
+    let weight_size: u64 = if root.join("offload_index.json").is_file() {
+        fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("resident-") && n.ends_with(".safetensors"))
+            })
+            .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+            .sum()
+    } else {
+        fs::read_dir(root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                !p.file_name().is_some_and(|n| {
+                    n.to_string_lossy().starts_with(".minimlx-ssd")
+                        || n.to_string_lossy().starts_with(".minimlx-mtp")
+                })
+            })
+            .map(|p| {
+                if p.is_dir() {
+                    directory_size(&p)
+                } else {
+                    fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                }
+            })
+            .sum()
+    };
+    let resident_size = weight_size.saturating_sub(
+        if root.join("offload_index.json").is_file() {
+            paged_external_ple_bytes(root).unwrap_or(0)
+        } else {
+            0
+        },
+    );
+    resident_size.saturating_mul(MODEL_WEIGHT_OVERHEAD_NUMERATOR) / MODEL_WEIGHT_OVERHEAD_DENOMINATOR
 }
 
 fn estimate_model_runtime_memory(model_path: &str, context_tokens: u32) -> u64 {
@@ -2583,14 +2974,24 @@ fn estimate_model_runtime_memory(model_path: &str, context_tokens: u32) -> u64 {
         keys.iter()
             .find_map(|key| model_config.get(*key).and_then(Value::as_u64))
     };
-    let layers = config_u64(&["num_hidden_layers", "n_layer"]);
+    let layers = (config.get("model_type").and_then(Value::as_str) == Some("qwen4_exp"))
+        .then(|| model_config.get("layer_types").and_then(Value::as_array))
+        .flatten()
+        .filter(|types| !types.is_empty())
+        .map(|types| {
+            types
+                .iter()
+                .filter(|kind| kind.as_str() == Some("full_attention"))
+                .count() as u64
+        })
+        .or_else(|| config_u64(&["num_hidden_layers", "n_layer"]));
     let kv_heads = config_u64(&["num_key_value_heads", "num_kv_heads"]);
     let attention_heads = config_u64(&["num_attention_heads", "n_head"]);
     let hidden_size = config_u64(&["hidden_size", "n_embd"]);
     let head_dim = config_u64(&["head_dim"]).or_else(|| {
-        hidden_size.zip(attention_heads).and_then(|(hidden, heads)| {
-            (heads > 0).then_some(hidden / heads)
-        })
+        hidden_size
+            .zip(attention_heads)
+            .and_then(|(hidden, heads)| (heads > 0).then_some(hidden / heads))
     });
     let kv_cache = layers
         .zip(kv_heads)
@@ -2696,16 +3097,15 @@ fn downloaded_bytes_for_files(directory: &Path, files: &[RemoteModelFile]) -> u6
 #[cfg(test)]
 mod model_discovery_tests {
     use super::{
-        discover_model_directories, downloaded_bytes_for_files, huggingface_file_url,
-        huggingface_model_search_params, huggingface_model_search_url,
-        is_unneeded_huggingface_metadata, should_retry_download_status, download_retry_delay,
-        estimate_model_runtime_memory, is_managed_model_dir, is_model_dir,
-        model_display_name, same_filesystem_path, modelscope_file_url,
+        Backend, DownloadContext, ModelSearchResult, ModelSearchSort, ModelSearchSortDirection,
+        RemoteModelFile, discover_model_directories, download_retry_delay,
+        downloaded_bytes_for_files, estimate_model_runtime_memory, huggingface_file_url,
+        huggingface_model_search_params, huggingface_model_search_url, is_managed_model_dir,
+        is_model_dir, is_unneeded_huggingface_metadata, model_display_name, modelscope_file_url,
         modelscope_model_search_params, modelscope_model_search_url, parse_content_range_start,
-        parse_huggingface_repo_size, save_download_manifest, sort_model_search_results,
-        validate_external_model_directory, validate_remote_path, validate_repo_id, Backend,
-        DownloadContext, ModelSearchResult, ModelSearchSort, ModelSearchSortDirection,
-        RemoteModelFile,
+        parse_huggingface_repo_size, same_filesystem_path, save_download_manifest,
+        should_retry_download_status, sort_model_search_results, validate_external_model_directory,
+        validate_remote_path, validate_repo_id,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2720,6 +3120,49 @@ mod model_discovery_tests {
         contents.extend(padded);
         contents.extend([0_u8; 4]);
         fs::write(path, contents).expect("complete safetensors fixture should be written");
+    }
+
+    #[test]
+    fn model_api_id_uses_public_name_and_alias() {
+        let path = std::path::Path::new("/models/mlx-community--Llama-3.2-3B-Instruct-4bit");
+        assert_eq!(super::model_api_id(path, None), "Llama-3.2-3B-Instruct-4bit");
+        assert_eq!(super::model_api_id(path, Some("my-alias")), "my-alias");
+        let snapshot = std::path::Path::new("/cache/models--org--model--variant/snapshots/revision");
+        assert_eq!(super::model_api_id(snapshot, None), "model--variant");
+    }
+
+    #[test]
+    fn ssd_paging_recognizes_qwen36_35b_geometry() {
+        let config = serde_json::json!({"model_type":"qwen3_5_moe", "text_config":{
+            "num_experts":256,"hidden_size":2048,"num_hidden_layers":40}});
+        assert!(super::supports_ssd_paging_config(&config));
+        let mut other = config.clone();
+        other["text_config"]["num_experts"] = serde_json::json!(128);
+        assert!(!super::supports_ssd_paging_config(&other));
+        assert!(super::supports_ssd_paging_config(&serde_json::json!({"model_type":"qwen4_exp"})));
+    }
+
+    #[test]
+    fn paged_ple_memory_excludes_only_valid_external_tensor_ranges() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("minimlx-ple-memory-{}-{nonce}", std::process::id()));
+        let paged = root.join(".minimlx-ssd");
+        fs::create_dir_all(&paged).unwrap();
+        let name = "model.ple.ple_embedding.ngram_embedding.shards.0.weight";
+        let config = serde_json::json!({"model_type":"qwen4_exp", "quantization":{"bits":4,"group_size":32,"mode":"affine"}});
+        fs::write(root.join("config.json"), config.to_string()).unwrap();
+        fs::write(paged.join("config.json"), config.to_string()).unwrap();
+        fs::write(root.join("model.safetensors.index.json"), serde_json::json!({"weight_map":{name:"weights.safetensors"}}).to_string()).unwrap();
+        let header = serde_json::json!({name:{"dtype":"U32","shape":[2],"data_offsets":[0,8]}, "other":{"dtype":"U32","shape":[2],"data_offsets":[8,16]}}).to_string();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header.as_bytes());
+        bytes.extend([0u8; 16]);
+        fs::write(paged.join("resident-0001.safetensors"), &bytes).unwrap();
+        assert_eq!(super::paged_external_ple_bytes(&paged), Some(8));
+        bytes.truncate(bytes.len() - 12);
+        fs::write(paged.join("resident-0001.safetensors"), &bytes).unwrap();
+        assert_eq!(super::paged_external_ple_bytes(&paged), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2818,6 +3261,38 @@ mod model_discovery_tests {
     }
 
     #[test]
+    fn managed_ssd_copy_requires_all_manifest_files_and_is_not_a_second_model() {
+        let root = model_fixture(r#"{"model_type":"qwen4_exp"}"#, "ssd");
+        let copy = root.join(".minimlx-ssd");
+        fs::create_dir_all(copy.join("experts")).unwrap();
+        fs::write(copy.join("config.json"), r#"{"model_type":"qwen4_exp"}"#).unwrap();
+        fs::write(copy.join("tokenizer_config.json"), "{}").unwrap();
+        fs::write(
+            copy.join("offload_index.json"),
+            r#"{"layers":[0,1],"num_experts":2}"#,
+        )
+        .unwrap();
+        fs::write(
+            copy.join(".minimlx-ssd-manifest.json"),
+            r#"{"resident":["resident-0001.safetensors","resident-0002.safetensors"]}"#,
+        )
+        .unwrap();
+        write_safetensors(&copy.join("resident-0001.safetensors"));
+        write_safetensors(&copy.join("resident-0002.safetensors"));
+        write_safetensors(&copy.join("experts/layer_0000.safetensors"));
+        assert!(!is_model_dir(&copy));
+        write_safetensors(&copy.join("experts/layer_0001.safetensors"));
+        assert!(is_model_dir(&copy));
+        assert_eq!(
+            discover_model_directories(std::slice::from_ref(&root)),
+            vec![root.clone()]
+        );
+        fs::remove_file(copy.join("resident-0002.safetensors")).unwrap();
+        assert!(!is_model_dir(&copy));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn only_models_in_the_model_inventory_are_loadable_or_startable() {
         let listed_fixture = model_fixture(
             r#"{"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"]}"#,
@@ -2838,7 +3313,8 @@ mod model_discovery_tests {
         let models = root.join("models");
         fs::create_dir_all(&models).expect("managed models directory should be created");
         let listed = models.join("listed-model");
-        fs::rename(&listed_fixture, &listed).expect("listed model should be moved into the library");
+        fs::rename(&listed_fixture, &listed)
+            .expect("listed model should be moved into the library");
         let mut backend = Backend::new(root.clone(), PathBuf::from("python"), models.clone());
         backend
             .configure_storage(vec![models])
@@ -2852,14 +3328,29 @@ mod model_discovery_tests {
         ));
         assert!(backend.is_listed_model_path(&listed.display().to_string()));
         assert!(!backend.is_listed_model_path(&external.display().to_string()));
-        assert!(backend
-            .start_api_with_options(&external.display().to_string(), None)
-            .unwrap_err()
-            .contains("Only models in the MiniMLX model list can be started"));
+        assert!(
+            backend
+                .start_api_with_options(&external.display().to_string(), None)
+                .unwrap_err()
+                .contains("Only models in the MiniMLX model list can be started")
+        );
 
         drop(backend);
         fs::remove_dir_all(external).expect("external model fixture should be removed");
         fs::remove_dir_all(root).expect("managed model fixture should be removed");
+    }
+
+    #[test]
+    fn qwen4_context_estimate_counts_only_full_attention_layers() {
+        let model = model_fixture(
+            r#"{"model_type":"qwen4_exp","text_config":{"num_hidden_layers":4,"num_key_value_heads":1,"head_dim":16,"layer_types":["linear_attention","linear_attention","linear_attention","full_attention"]}}"#,
+            "hybrid-memory-estimate",
+        );
+        let path = model.display().to_string();
+        let base = estimate_model_runtime_memory(&path, 0);
+        let with_context = estimate_model_runtime_memory(&path, 8);
+        assert_eq!(with_context - base, 8 * 16 * 4 * 3 / 2);
+        fs::remove_dir_all(model).unwrap();
     }
 
     #[test]
@@ -2882,8 +3373,14 @@ mod model_discovery_tests {
 
     #[test]
     fn memory_guard_keeps_a_scaled_but_bounded_os_reserve() {
-        assert_eq!(super::memory_headroom(64 * super::GIB), 1 * super::GIB + super::GIB / 2);
-        assert_eq!(super::memory_headroom(16 * super::GIB), 1 * super::GIB + super::GIB / 2);
+        assert_eq!(
+            super::memory_headroom(64 * super::GIB),
+            1 * super::GIB + super::GIB / 2
+        );
+        assert_eq!(
+            super::memory_headroom(16 * super::GIB),
+            1 * super::GIB + super::GIB / 2
+        );
         assert_eq!(
             super::memory_headroom(128 * super::GIB),
             2 * super::GIB + super::GIB * 56 / 100
@@ -2901,9 +3398,11 @@ mod model_discovery_tests {
             no_proxy: String::new(),
             ca_bundle: String::new(),
         };
-        assert!(Backend::search_models(&context, "q", "huggingface")
-            .expect("short query should be ignored")
-            .is_empty());
+        assert!(
+            Backend::search_models(&context, "q", "huggingface")
+                .expect("short query should be ignored")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2942,7 +3441,9 @@ mod model_discovery_tests {
         assert!(should_retry_download_status(
             reqwest::StatusCode::SERVICE_UNAVAILABLE
         ));
-        assert!(!should_retry_download_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!should_retry_download_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
         assert_eq!(
             download_retry_delay(Some("7"), 0),
             std::time::Duration::from_secs(7)
@@ -3000,7 +3501,11 @@ mod model_discovery_tests {
             file_url.origin().ascii_serialization(),
             "https://models.example"
         );
-        assert!(file_url.path().starts_with("/hub/api/v1/models/owner/model/repo"));
+        assert!(
+            file_url
+                .path()
+                .starts_with("/hub/api/v1/models/owner/model/repo")
+        );
     }
 
     #[test]
@@ -3350,7 +3855,10 @@ mod model_discovery_tests {
 
         assert!(!is_model_dir(&root));
         assert!(is_managed_model_dir(&root));
-        assert_eq!(discover_model_directories(std::slice::from_ref(&root)), vec![root.clone()]);
+        assert_eq!(
+            discover_model_directories(std::slice::from_ref(&root)),
+            vec![root.clone()]
+        );
 
         fs::remove_dir_all(root).expect("DFlash draft fixture should be removed");
     }

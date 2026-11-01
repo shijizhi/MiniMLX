@@ -146,14 +146,14 @@ so the next recommendation cannot drift between similarly named conversions.
 
 #### `mlx-community/Qwen3.5-27B-4bit` completed run
 
-- Local artifact: `/Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-27B-4bit`
+- Local artifact: `/path/to/Qwen3.5-27B-4bit`
 - Cached revision: `45797d2985a12c55e6473686e9ea91b95e959553`
 - Descriptor: `Qwen3_5ForConditionalGeneration`, `qwen3_5`, Dense, affine Q4/group 64, 64 layers; all three indexed safetensor shards present.
 - Environment: Apple M5 Pro, 64 GiB unified memory; Python 3.13.12, MLX 0.32.2, mlx-lm 0.31.3, mlx-vlm 0.7.2; MiniMLX git revision `dbad46b` (working tree had other changes).
 - Text smoke: PASS, 4/4 generated; peak 16.830 GiB.
 - Vision: PASS, `Benchmarks/fixtures/swift-t-banner.png`; two requests each recognized `Swift / Transformers` (4,155 prompt tokens, 5 completion tokens). Feature cache changed from 1 miss/store to 1 hit; entry count remained 1.
 - Performance: MiniMLX-only, autoregressive; warm-up 32, max 128, step 1024, contexts 1024/4096/8192/16384, five measured runs each. Suite peak 18.465 GiB. No oMLX benchmark was run. The 1K request stopped at 111/128; its TG/E2E are retained as observed values, not a full-length decode comparison.
-- Command: `PYTHONPATH=python ./.venv/bin/python tools/benchmark_context_matrix.py /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-27B-4bit Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128 --repeats 5 --step 1024 --contexts 1024 4096 8192 16384`
+- Command: `PYTHONPATH=python ./.venv/bin/python tools/benchmark_context_matrix.py /path/to/Qwen3.5-27B-4bit Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128 --repeats 5 --step 1024 --contexts 1024 4096 8192 16384`
 
 | Context | Median TTFT ms | Median TPOT ms | Median PP TPS | Median TG TPS | Generated | Median E2E ms | Five raw samples (TTFT / TPOT / PP / TG / E2E) |
 |---:|---:|---:|---:|---:|---:|---:|---|
@@ -169,7 +169,7 @@ the five-run median above. It was run after the five-run suite and therefore
 does not establish a fully cold-machine baseline. Suite peak was 18.464 GiB;
 1K again ended naturally at 111/128 tokens.
 
-Command: `PYTHONUNBUFFERED=1 PYTHONPATH=python ./.venv/bin/python tools/benchmark_context_matrix.py /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-27B-4bit Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128 --repeats 1 --step 1024 --contexts 1024 4096 8192 16384`
+Command: `PYTHONUNBUFFERED=1 PYTHONPATH=python ./.venv/bin/python tools/benchmark_context_matrix.py /path/to/Qwen3.5-27B-4bit Resources/BenchmarkCorpus/code_python.txt --warmup 32 --max-tokens 128 --repeats 1 --step 1024 --contexts 1024 4096 8192 16384`
 
 | Context | TTFT ms | TPOT ms | PP TPS | TG TPS | Generated | E2E ms |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -180,7 +180,7 @@ Command: `PYTHONUNBUFFERED=1 PYTHONPATH=python ./.venv/bin/python tools/benchmar
 
 #### `mlx-community/Qwen3.5-9B-4bit` completed run
 
-- Local artifact: `/Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-9B-4bit`
+- Local artifact: `/path/to/Qwen3.5-9B-4bit`
 - Descriptor: `Qwen3_5ForConditionalGeneration`; affine Q4, group size 64; 32 layers; `{"4": 32}` quantized Dense MLP layers; autoregressive decode.
 - Text smoke: PASS; output `Hello! How can`; 5.656 GiB peak.
 - Vision: PASS on `Benchmarks/fixtures/swift-t-banner.png`; output `Swift / Transformers`; prompt 4,161 tokens, completion 5 tokens.

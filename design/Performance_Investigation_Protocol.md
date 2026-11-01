@@ -171,7 +171,7 @@ minimlx native-py-profile-attention-types <model-directory> 16 3 5
 PyMiniMLX：
 
 ```text
-/Users/jizhishi/mycode/ai/pyminimlx/.venv/bin/python \
+../pyminimlx/.venv/bin/python \
   tools/profile_pymimix_attention_types.py \
   <model-directory> 16 3 5
 ```

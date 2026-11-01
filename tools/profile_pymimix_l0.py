@@ -4,14 +4,15 @@ Run with the PyMiniMLX virtual environment so MLX uses the local Metal device.
 """
 
 from pathlib import Path
+import os
 from statistics import median
 import sys
 import time
 
 import mlx.core as mx
 
-PYMINIMLX_ROOT = Path("/Users/jizhishi/mycode/ai/pyminimlx")
-MODEL_DIR = Path("/Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")
+PYMINIMLX_ROOT = Path(os.environ.get("PYMINIMLX_ROOT", "../pyminimlx")).expanduser()
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", "path/to/model")).expanduser()
 
 sys.path.insert(0, str(PYMINIMLX_ROOT / "src"))
 from pyminimlx.models import Qwen35Model  # noqa: E402

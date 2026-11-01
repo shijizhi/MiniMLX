@@ -145,6 +145,12 @@ class Qwen35Adapter(MLXVLMAdapter):
     def load(
         self, descriptor: ModelDescriptor, plan: ExecutionPlan | None = None
     ) -> "Qwen35Adapter":
+        if (Path(descriptor.model_dir) / "offload_index.json").is_file():
+            if plan is None:
+                raise ValueError("Paged Qwen3.5/3.6 requires an execution plan")
+            if self._mtp_draft_path(plan) or self._dflash_draft_path(plan):
+                raise RuntimeError("External MTP/DFlash drafts are not yet supported with Qwen3.5/3.6 SSD paging")
+            return self._load_vlm_backend(descriptor, plan)
         # Qwen3.5 checkpoints can advertise vision components on text-only
         # requests. Keep the selected plan's text baseline in that case.
         if (

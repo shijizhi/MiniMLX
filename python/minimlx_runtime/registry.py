@@ -1321,7 +1321,7 @@ def _describe_components(path: Path, config: dict) -> tuple:
 
     weight_files: dict[str, set[str]] = {}
     index_path = path / "model.safetensors.index.json"
-    if index_path.is_file():
+    if index_path.is_file() and not (path / "offload_index.json").is_file():
         try:
             index = json.loads(index_path.read_text())
             weight_map = index["weight_map"]

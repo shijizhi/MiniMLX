@@ -16,6 +16,7 @@ from minimlx_runtime.api.http import (
     _infer,
     _message_content,
     _model_id,
+    _is_requested_model,
     _prometheus_metrics,
 )
 from minimlx_runtime.api.memory import (
@@ -228,6 +229,20 @@ class HttpApiTests(unittest.TestCase):
         runtime = SimpleNamespace(descriptor=SimpleNamespace(model_dir="/models/publisher/checkpoint"))
         self.assertEqual(_model_id(runtime), "checkpoint")
         self.assertEqual(_model_id(runtime, "assistant-qwen"), "assistant-qwen")
+
+    def test_paged_model_accepts_original_repository_id_with_or_without_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            from pathlib import Path
+            source = Path(directory) / "mlx-community--Qwen3.5-35B-A3B-4bit"
+            source.mkdir()
+            (source / ".minimlx-repo-id").write_text("mlx-community/Qwen3.5-35B-A3B-4bit")
+            paged = source / ".minimlx-ssd"
+            paged.mkdir()
+            (paged / "offload_index.json").write_text("{}")
+            runtime = SimpleNamespace(descriptor=SimpleNamespace(model_dir=str(paged)))
+            self.assertEqual(_model_id(runtime), "Qwen3.5-35B-A3B-4bit")
+            self.assertTrue(_is_requested_model(runtime, "mlx-community/Qwen3.5-35B-A3B-4bit", _model_id(runtime), None))
+            self.assertTrue(_is_requested_model(runtime, "mlx-community/Qwen3.5-35B-A3B-4bit", _model_id(runtime, "my-model"), "my-model"))
 
     def test_content_accepts_text_and_local_or_data_uri_images(self):
         self.assertEqual(_message_content("hello")[0].text, "hello")

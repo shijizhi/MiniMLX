@@ -49,7 +49,7 @@ family configurations and quantization coverage are tracked in
 ## Priority deep validation: Qwen3.8-27B
 
 Checkpoint: `mlx-community/Qwen3.8-27B-4bit`, local path
-`/Users/jizhishi/.minimlx/models/mlx-community--Qwen3.8-27B-4bit`. It is a
+`/path/to/Qwen3.8-27B-4bit`. It is a
 complete three-shard affine Q4/group-64 checkpoint. Its config declares
 `qwen3_5` / `Qwen3_5ForConditionalGeneration`, a 64-layer hybrid text stack, a
 vision tower, 262,144 max positions, and a video preprocessor. The installed
@@ -354,9 +354,9 @@ comparison, not part of the compatibility acceptance gate.
 ## Verification command
 
 ```bash
-cd /Users/jizhishi/mycode/ai/minimlx
+cd /path/to/minimlx
 ./.venv/bin/python tools/verify_model_support.py \
-  /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-0.8B-MLX-bf16
+  /path/to/Qwen3.5-0.8B-MLX-bf16
 ```
 
 ## Acceptance criteria

@@ -105,15 +105,15 @@ def make_omlx_aligned_prompt(tokenizer, max_context: int, profile: str, corpus_d
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "config" / "minimlx.local.json"
-    config = json.loads(config_path.read_text())
+    config = json.loads(config_path.read_text()) if config_path.is_file() else {}
     apply_runtime_config(config)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_dir", nargs="?", default=config["model_dir"])
+    parser.add_argument("model_dir", nargs="?", default=config.get("model_dir", ""))
     parser.add_argument(
         "prompt_file",
         nargs="?",
-        default=str(root / config["prompt_file"]),
+        default=str(root / config.get("prompt_file", "Resources/BenchmarkCorpus/code_python.txt")),
     )
     parser.add_argument("--warmup", type=int, default=config.get("warmup", 32))
     parser.add_argument("--max-tokens", type=int, default=config.get("max_tokens", 128))
@@ -320,7 +320,7 @@ def main() -> None:
         )
     print(
         "decode backend "
-        f"({'DFlash' if dflash_enabled else 'Qwen3.5 MTP' if mtp_enabled else 'autoregressive'}"
+        f"({'DFlash' if dflash_enabled else 'MTP' if mtp_enabled else 'autoregressive'}"
         + (
             f", draft={Path(dflash_draft_path).name}, "
             f"block_size={min(getattr(getattr(adapter._dflash_draft_model, 'config', None), 'block_size', 5), int(os.environ.get('MINIMLX_DFLASH_BLOCK_SIZE', '5')))}"
@@ -336,6 +336,17 @@ def main() -> None:
         "runtime route "
         f"({'text-only mlx-lm' if not getattr(adapter, '_vlm_enabled', False) else 'mlx-vlm/MLLM'})"
     )
+    verifier = getattr(adapter, "_mtp_verifier", None)
+    if mtp_enabled and verifier:
+        print(f"MTP verifier ({verifier})")
+    expert_store = getattr(getattr(adapter, "model", None), "moe_offload_store", None)
+    if expert_store is not None:
+        cache_stats = expert_store.stats()
+        print(
+            "SSD expert paging "
+            f"(cache_budget_gb={cache_stats['budget_bytes'] / 1e9:.2f}, "
+            f"parallel_reads={getattr(adapter, '_parallel_expert_reads', None) is not None})"
+        )
     print(
         "prefill/decode options ("
         f"skip_intermediate_logits_requested={os.environ.get('MINIMLX_PREFILL_SKIP_LOGITS') == '1'}, "
@@ -740,6 +751,10 @@ def main() -> None:
 
         measurements = []
         for repeat in range(args.repeats):
+            mtp_stats_before = None
+            if mtp_enabled and getattr(adapter, "_mtp_draft_model", None) is not None:
+                from mlx_vlm.speculative.common import speculative_stats_snapshot
+                mtp_stats_before = speculative_stats_snapshot(adapter._mtp_draft_model)
             if mtp_enabled:
                 reset_mtp_verify_fused_attention_stats()
                 reset_mtp_gdn_prework_routes()
@@ -750,6 +765,9 @@ def main() -> None:
                 context_tokens=context,
                 prefill_step_size=args.step,
             )
+            if mtp_stats_before is not None:
+                from mlx_vlm.speculative.common import speculative_stats_since
+                mtp_stats_after = speculative_stats_since(adapter._mtp_draft_model, mtp_stats_before)
             generated_tokens = len(result.generated_tokens)
             if len(result.prompt_tokens) != context or not 0 < generated_tokens <= args.max_tokens:
                 raise RuntimeError(
@@ -802,6 +820,8 @@ def main() -> None:
             rounds = len(trace)
             drafted = sum(int(row.get("drafted", 0)) for row in trace)
             accepted = sum(int(row.get("accepted", 0)) for row in trace)
+            if not trace and mtp_stats_before is not None:
+                rounds, accepted, drafted = (value or 0 for value in mtp_stats_after)
             acceptance_pct = 100.0 * accepted / drafted if drafted else 0.0
             route_calls, fallbacks = mtp_verify_fused_attention_stats()
             print(
@@ -812,6 +832,14 @@ def main() -> None:
                 f"gdn_prefill_routes={gdn_prefill_routes} "
                 f"gdn_prefill_fallbacks={gdn_prefill_fallbacks}"
             )
+
+    if expert_store is not None:
+        cache_stats = expert_store.stats()
+        print(
+            "SSD expert cache totals "
+            f"(hits={cache_stats['hits']}, misses={cache_stats['misses']}, "
+            f"evictions={cache_stats['evictions']}, hit_rate={cache_stats['hit_rate']})"
+        )
 
     try:
         import mlx.core as mx

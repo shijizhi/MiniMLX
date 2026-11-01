@@ -142,8 +142,25 @@ fn load_config(root: &std::path::Path) -> AppConfig {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("MiniMLX {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let launch_gui = args.len() == 1 || args.iter().any(|arg| arg == "--gui");
     if launch_gui {
+        #[cfg(target_os = "macos")]
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(contents) = executable.parent().and_then(|p| p.parent()) {
+                let resources = contents.join("Resources");
+                let python = resources.join("runtime/bin/python3");
+                if python.is_file() && resources.join("python/minimlx_runtime").is_dir() {
+                    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+                    let model_dir = home.join(".minimlx/models");
+                    minimlx_gpui::run_app(model_dir.to_string_lossy().into_owned(), resources, python);
+                    return;
+                }
+            }
+        }
         let root = std::env::current_dir().expect("current directory");
         let config = load_config(&root);
         #[cfg(target_os = "macos")]

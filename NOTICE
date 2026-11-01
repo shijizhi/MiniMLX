@@ -1,0 +1,30 @@
+MiniMLX includes or distributes the following third-party materials:
+
+1. gpui-component
+
+   The vendored source under vendor/gpui-component/ is from:
+   https://github.com/longbridge/gpui-component
+
+   It is licensed under the Apache License 2.0. Its license text is included
+   at vendor/gpui-component/LICENSE-APACHE.
+
+2. Lucide icons
+
+   The SVG icons under crates/minimlx-gpui/assets/icons/ are based on Lucide:
+   https://github.com/lucide-icons/lucide
+
+   Lucide is licensed under the ISC License. Source and attribution details
+   are documented in crates/minimlx-gpui/assets/icons/SOURCES.md.
+
+3. oMLX inference components
+
+   The files under python/minimlx_runtime/omlx_kernels/ are from oMLX:
+   https://github.com/jundot/omlx
+   revision 5c6cbd6314cadba33f0db3f90f27dce6620831b4.
+   They are licensed under the Apache License 2.0, included in LICENSE.
+   moe_expert_offload.py is adapted to omit oMLX's optional native staging
+   and scheduler dependencies.
+
+Additional transitive dependencies are governed by the licenses recorded in
+their respective package metadata and lockfiles. Redistributors must retain
+the applicable license and attribution notices.

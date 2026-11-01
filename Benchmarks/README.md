@@ -50,8 +50,9 @@ decode 和 tok/s。它只用于确认阶段优化最终是否反映到用户可�
 ## 当前入口
 
 ```bash
+MODEL_DIR=/path/to/Qwen3.5-0.8B-MLX-4bit
 PYTHONPATH=python .venv/bin/python benchmarks/run.py \
-  --model /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-0.8B-MLX-4bit \
+  --model "$MODEL_DIR" \
   --suite e2e --prompt Hello --max-tokens 16 \
   --warmup 3 --repeats 5 --output results/latest.json
 ```

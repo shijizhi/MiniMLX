@@ -10,7 +10,7 @@ Build a fixed-shape Core ML model from the real Qwen3.5 L17 `in_proj_z` weights:
 ./.venv/bin/python tools/build_ane_linear_probe.py \
   /tmp/minimlx-qwen35-l17-z-4096.mlmodel \
   --tokens 4096 \
-  --model-dir /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-0.8B-MLX-4bit \
+  --model-dir /path/to/Qwen3.5-0.8B-MLX-4bit \
   --layer 17
 ```
 
@@ -19,7 +19,7 @@ the saved ANE output with MiniMLX's real Q4 path:
 
 ```sh
 ./.venv/bin/python tools/profile_ane_vs_minimlx_q4.py \
-  /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-0.8B-MLX-4bit \
+  /path/to/Qwen3.5-0.8B-MLX-4bit \
   --layer 17 --tokens 4096 \
   --ane-output /tmp/minimlx-qwen35-l17-z-4096-ane-output.bin
 ```

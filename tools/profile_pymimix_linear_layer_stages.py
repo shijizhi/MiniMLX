@@ -1,12 +1,13 @@
 """Exact production-path decomposition for one cached linear decoder layer."""
 
 from pathlib import Path
+import os
 import sys
 import time
 
 import mlx.core as mx
 
-PYMINIMLX_ROOT = Path("/Users/jizhishi/mycode/ai/pyminimlx")
+PYMINIMLX_ROOT = Path(os.environ.get("PYMINIMLX_ROOT", "../pyminimlx")).expanduser()
 sys.path.insert(0, str(PYMINIMLX_ROOT / "src"))
 from pyminimlx.models import Qwen35Model  # noqa: E402
 

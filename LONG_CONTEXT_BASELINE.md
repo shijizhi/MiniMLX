@@ -16,7 +16,7 @@ Run from the project root, without extra arguments or environment variables:
 
 Configuration at the time of measurement: warmup 32, repeats 5, median,
 prefill step 2048, model
-`/Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-4B-MLX-4bit`.
+`/path/to/Qwen3.5-4B-MLX-4bit`.
 The benchmark printed `q4_native=True`, `fa256_native=True`,
 `q4_dense_disabled=False`, `q4_mlp_fusion_disabled=True`. On this GPU, native
 Q4 NAX reports unavailable and correctly falls back.

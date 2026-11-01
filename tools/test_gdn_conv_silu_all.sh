@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-MODEL_DIR="${1:-/Users/jizhishi/.minimlx/models/mlx-community--Qwen3.8-27B-4bit}"
+MODEL_DIR="${1:-/path/to/Qwen3.8-27B-4bit}"
 PROMPT_FILE="${2:-Resources/BenchmarkCorpus/code_python.txt}"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 

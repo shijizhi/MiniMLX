@@ -110,7 +110,7 @@ MiniMLXAttention.callAsFunction
 minimlx native-profile-q <model-directory>
 ```
 
-它在 [Qwen35NativeModel.swift:706](/Users/jizhishi/mycode/ai/minimlx/Sources/MiniMLX/Models/Qwen35NativeModel.swift:706)
+它在 `Qwen35NativeModel.swift:706`
 中执行与 PyMiniMLX 相同的 5 次 warmup，并在同一次运行中对 wrapper 和直接
 `quantizedMM` 做 A/B 对照。两条 Swift 路径分别为 0.212 ms 和 0.221 ms，
 PyMiniMLX 为 0.222 ms；因此旧的单次 0.75–0.82 ms、0.393 ms、0.272 ms

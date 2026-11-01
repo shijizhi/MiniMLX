@@ -72,6 +72,7 @@ class Runtime:
         self.provider_adapter_factories = {
             qwen35.name: qwen35.name,
             "qwen35-vlm": qwen35.name,
+            "qwen38-vlm": mlx_vlm.name,
             "mlx-vlm-generation": mlx_vlm.name,
             "deepseek41-mlx-vlm": deepseek41.name,
             standard_text.name: standard_text.name,
@@ -94,6 +95,7 @@ class Runtime:
         self.task_executors = {
             "qwen35-mlx-lm": self._execute_generation,
             "qwen35-vlm": self._execute_generation,
+            "qwen38-vlm": self._execute_generation,
             "mlx-lm-standard": self._execute_generation,
             "mlx-vlm-generation": self._execute_generation,
         }

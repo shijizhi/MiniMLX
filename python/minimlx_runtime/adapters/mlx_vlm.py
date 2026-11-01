@@ -11,6 +11,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from ..api.memory import read_system_memory
+from ..offload import qwen38_should_use_ssd_offload
 from ..types import ComponentKind, ExecutionPlan, ModelDescriptor
 
 
@@ -188,6 +190,10 @@ class MLXVLMAdapter:
         self._prompt_cache_states: dict[str, Any] = {}
         self._apc_manager: Any | None = None
         self._vlm_enabled = False
+        self._parallel_expert_reads = None
+        self._mtp_enabled = False
+        self._mtp_draft_model = None
+        self._mtp_verifier = None
 
     @classmethod
     def can_load(cls, descriptor: ModelDescriptor) -> bool:
@@ -212,6 +218,40 @@ class MLXVLMAdapter:
             raise RuntimeError("mlx-vlm could not access the Apple Metal device") from exc
 
         load_options: dict[str, Any] = {}
+        if (descriptor.model_type == "qwen3_5_moe"
+                and (Path(descriptor.model_dir) / "offload_index.json").is_file()):
+            cache = os.environ.get("MINIMLX_EXPERT_CACHE_GB", "").strip()
+            cache_gb = float(cache) if cache else 2.0
+            if not 0 < cache_gb <= 1024:
+                raise ValueError("Expert cache must be greater than 0 and at most 1024 GB")
+            load_options = {"lazy": True, "expert_cache_gb": cache_gb}
+        if descriptor.metadata.get("is_qwen38_flash_next"):
+            memory = read_system_memory()
+            requires_offload = qwen38_should_use_ssd_offload(
+                int(descriptor.metadata.get("total_weight_bytes") or 0),
+                total_memory_bytes=memory.total_bytes,
+                available_memory_bytes=memory.available_bytes,
+            )
+            if requires_offload and not (Path(descriptor.model_dir) / "offload_index.json").is_file():
+                raise RuntimeError(
+                    "Qwen3.8 Flash Next exceeds available memory and requires an "
+                    "mlx-vlm expert-offload checkpoint; this checkpoint has not "
+                    "been repacked for SSD paging."
+                )
+            if requires_offload:
+                load_options = {"lazy": True}
+            if (Path(descriptor.model_dir) / "offload_index.json").is_file():
+                # Paged checkpoints must stay lazy even when their resident
+                # shard sizes happen to fit the current memory snapshot.
+                load_options["lazy"] = True
+                cache = os.environ.get("MINIMLX_EXPERT_CACHE_GB", "").strip()
+                if cache:
+                    cache_gb = float(cache)
+                    if not 0 < cache_gb <= 1024:
+                        raise ValueError("Expert cache must be greater than 0 and at most 1024 GB")
+                else:
+                    cache_gb = 12.0
+                load_options["expert_cache_gb"] = cache_gb
         if plan is not None and plan.backend_adapter == "deepseek41-mlx-vlm-runtime":
             # mlx-vlm's offload directory activates its native routed-expert
             # pager. Keep loading lazy and bound the resident expert cache.
@@ -222,8 +262,22 @@ class MLXVLMAdapter:
                     float(os.environ.get("MINIMLX_DEEPSEEK41_EXPERT_CACHE_GB", "8")),
                 ),
             }
+        load_path = descriptor.model_dir
+        ple_ssd_enabled = (descriptor.metadata.get("is_qwen38_flash_next")
+                and (Path(descriptor.model_dir) / "offload_index.json").is_file()
+                and os.environ.get("MINIMLX_QWEN4_PLE_SSD", "1") != "0")
+        if ple_ssd_enabled:
+            from ..ple_offload import prepare_paged_ple_view, supports_paged_ple
+            ple_ssd_enabled = supports_paged_ple(descriptor.model_dir)
+            if ple_ssd_enabled:
+                load_path = str(prepare_paged_ple_view(descriptor.model_dir))
         try:
-            self.model, self.processor = load(descriptor.model_dir, **load_options)
+            if ple_ssd_enabled:
+                from ..ple_offload import shared_ple_mappings
+                with shared_ple_mappings():
+                    self.model, self.processor = load(load_path, **load_options)
+            else:
+                self.model, self.processor = load(load_path, **load_options)
         except (ImportError, ModuleNotFoundError):
             raise
         except Exception as exc:
@@ -231,6 +285,33 @@ class MLXVLMAdapter:
                 f"mlx-vlm could not load this checkpoint ({descriptor.model_type}/"
                 f"{descriptor.architecture}): {exc}"
             ) from exc
+        if (descriptor.model_type == "qwen3_5_moe"
+                and (Path(descriptor.model_dir) / "offload_index.json").is_file()):
+            from ..parallel_experts import install_parallel_expert_reads
+            self._parallel_expert_reads = install_parallel_expert_reads(self.model, exact_rows=True)
+        if descriptor.metadata.get("is_qwen38_flash_next") and (Path(descriptor.model_dir) / "offload_index.json").is_file():
+            from ..parallel_experts import install_parallel_expert_reads
+            self._parallel_expert_reads = install_parallel_expert_reads(self.model)
+            from ..qwen4_mtp import embedded_mtp_source
+            if (os.environ.get("MINIMLX_QWEN4_OMLX_SLOTS", "1") != "0"
+                    and embedded_mtp_source(descriptor.model_dir) is not None):
+                from ..omlx_expert_slots import install_omlx_expert_slots
+                install_omlx_expert_slots(self.model, self._parallel_expert_reads)
+        if descriptor.metadata.get("is_qwen38_flash_next") and os.environ.get("MINIMLX_DISABLE_EMBEDDED_MTP") != "1" and not os.environ.get("MINIMLX_DFLASH_DRAFT_MODEL") and not os.environ.get("MINIMLX_MTP_DRAFT_MODEL"):
+            from ..qwen4_mtp import embedded_mtp_source, prepare_embedded_mtp, install_exact_mtp_verifier
+            source = embedded_mtp_source(descriptor.model_dir)
+            if source is not None:
+                from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+                draft, kind = load_drafter(str(prepare_embedded_mtp(source)), kind="mtp")
+                validate_drafter_compatibility(self.model, draft, kind)
+                install_exact_mtp_verifier(self.model)
+                self._mtp_draft_model = draft
+                self._mtp_verifier = "serial_exact"
+                if os.environ.get("MINIMLX_QWEN4_MTP_BATCH_VERIFY", "1") != "0":
+                    from ..qwen4_batch_verify import install_batch_mtp_verifier
+                    install_batch_mtp_verifier(self.model)
+                    self._mtp_verifier = "batch_exact"
+                self._mtp_enabled = True
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
         self.descriptor = descriptor
         self._apc_manager = self._create_apc_manager(descriptor)
@@ -275,6 +356,9 @@ class MLXVLMAdapter:
             raise RuntimeError(f"could not initialize optional mlx-vlm APC: {exc}") from exc
 
     def unload(self) -> None:
+        if self._parallel_expert_reads is not None:
+            self._parallel_expert_reads.close()
+            self._parallel_expert_reads = None
         self._prompt_cache_states.clear()
         if self._apc_manager is not None:
             self._apc_manager.clear()
@@ -283,6 +367,9 @@ class MLXVLMAdapter:
         self.tokenizer = None
         self.processor = None
         self.model = None
+        self._mtp_draft_model = None
+        self._mtp_enabled = False
+        self._mtp_verifier = None
         self.descriptor = None
         self._vlm_enabled = False
         import sys
@@ -505,6 +592,8 @@ class MLXVLMAdapter:
             presence_penalty,
             frequency_penalty,
         )
+        if self._mtp_enabled:
+            kwargs.update(draft_model=self._mtp_draft_model, draft_kind="mtp")
         if os.environ.get("MINIMLX_IGNORE_EOS") == "1":
             # mlx-vlm owns EOS handling through tokenizer.stopping_criteria;
             # changing mlx-lm's tokenizer.eos_token_ids is not sufficient for
@@ -576,6 +665,8 @@ class MLXVLMAdapter:
             presence_penalty,
             frequency_penalty,
         )
+        if self._mtp_enabled:
+            kwargs.update(draft_model=self._mtp_draft_model, draft_kind="mtp")
         if os.environ.get("MINIMLX_IGNORE_EOS") == "1":
             # Keep text-only VLM-backend benchmarks on the same fixed-length
             # decode protocol as the mlx-lm path.

@@ -20,7 +20,7 @@ Run the text-only A/B on a VLM checkpoint with Metal available:
 
 ```bash
 PYTHONPATH=python ./.venv/bin/python tools/experiment_vlm_apc.py \
-  /Users/jizhishi/.minimlx/models/mlx-community--Qwen3.8-27B-4bit \
+  /path/to/Qwen3.8-27B-4bit \
   Resources/BenchmarkCorpus/code_python.txt \
   --prompt-chars 8000 --max-tokens 8 --warmup 0 --repeats 1 --memory-gb 1
 ```

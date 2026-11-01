@@ -57,9 +57,9 @@ load, routing, shared-expert execution, and short greedy generation pass.
 Run from an interactive macOS terminal/RustRover process with GPU access:
 
 ```bash
-cd /Users/jizhishi/mycode/ai/minimlx
+cd /path/to/minimlx
 ./.venv/bin/python tools/verify_model_support.py \
-  /Users/jizhishi/.omlx/models/mlx-community/Qwen3.5-35B-A3B-OptiQ-4bit-REAP-19B \
+  /path/to/Qwen3.5-35B-A3B-OptiQ-4bit-REAP-19B \
   --max-tokens 4
 ```
 

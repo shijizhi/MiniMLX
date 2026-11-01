@@ -304,7 +304,7 @@ MiniMLX 完成单次 1K/4K/8K/16K 测量，表面上全项优于截图所列 oML
 | 16K | 10,321.5 | 20.34 | 1,587.4 | 52.43 | 16/128 | 10,944.0 |
 
 每个上下文的三次原始样本、运行命令和协议记录在
-[`Qwen35_Family_Coverage.md`](/Users/jizhishi/mycode/ai/minimlx/design/Qwen35_Family_Coverage.md)。
+[`Qwen35_Family_Coverage.md`](Qwen35_Family_Coverage.md)。
 
 ## Qwen3.5-27B-4bit (MiniMLX result + user-supplied oMLX reference)
 
@@ -325,7 +325,7 @@ MiniMLX 完成单次 1K/4K/8K/16K 测量，表面上全项优于截图所列 oML
 | 16K | 42,153.1 | 63.91 | 388.7 | 15.77 | 128/128 | 50,584.8 |
 
 五次原始样本（每项顺序 TTFT ms / TPOT ms / PP TPS / TG TPS / E2E ms）和精确运行命令见
-[`Qwen35_Family_Coverage.md`](/Users/jizhishi/mycode/ai/minimlx/design/Qwen35_Family_Coverage.md)。
+[`Qwen35_Family_Coverage.md`](Qwen35_Family_Coverage.md)。
 
 ### 用户提供的 oMLX 对照截图
 
