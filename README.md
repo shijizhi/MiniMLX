@@ -17,6 +17,7 @@
     <a href="#connect-your-apps">Connect your apps</a> ·
     <a href="#license">License</a>
   </p>
+  <p><strong>English</strong> · <a href="README.zh.md">简体中文</a></p>
 </div>
 
 ---
