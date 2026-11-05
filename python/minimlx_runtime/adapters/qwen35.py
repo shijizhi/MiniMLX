@@ -121,12 +121,6 @@ class Qwen35Adapter(MLXVLMAdapter):
         self._vision_feature_cache_stores = 0
 
     def can_load(self, descriptor: ModelDescriptor) -> bool:
-        identity = str(
-            descriptor.metadata.get("repository_id")
-            or Path(descriptor.model_dir).name
-        ).lower()
-        if re.search(r"qwen\s*3[._-]?8", identity):
-            return False
         value = f"{descriptor.model_type} {descriptor.architecture}".lower()
         return "qwen3" in value and "5" in value
 

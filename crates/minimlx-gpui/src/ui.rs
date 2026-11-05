@@ -62,6 +62,18 @@ use super::backend::{
 use super::gpu_telemetry::GpuTelemetry;
 use serde_json::Value;
 
+fn benchmark_error_summary(error: &str) -> String {
+    error.lines()
+        .find_map(|line| {
+            let line = line.trim();
+            ["RuntimeError: ", "ValueError: ", "OSError: "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .unwrap_or_else(|| error.lines().find(|line| !line.trim().is_empty()).unwrap_or("Unknown error"))
+        .to_owned()
+}
+
 fn tr(language: &str, source: &str) -> String {
     if language != "zh-CN" {
         return source.to_string();
@@ -900,7 +912,7 @@ struct DesktopSettings {
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
-            language: "en".into(),
+            language: system_default_language().into(),
             port: 18765,
             max_tokens: 32768,
             max_context_tokens: 32768,
@@ -931,6 +943,34 @@ impl Default for DesktopSettings {
             ca_bundle: String::new(),
         }
     }
+}
+
+fn language_for_system_preference(preference: &str) -> &'static str {
+    let language = preference.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == ',');
+    if language.eq_ignore_ascii_case("zh")
+        || language.to_ascii_lowercase().starts_with("zh-")
+        || language.to_ascii_lowercase().starts_with("zh_")
+    {
+        "zh-CN"
+    } else {
+        "en"
+    }
+}
+
+fn system_default_language() -> &'static str {
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", "-g", "AppleLanguages"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(first) = text.lines().map(str::trim).find(|line| !line.is_empty() && *line != "(" && *line != ")") {
+                return language_for_system_preference(first);
+            }
+        }
+    }
+    std::env::var("LANG").ok().map(|value| language_for_system_preference(&value)).unwrap_or("en")
 }
 
 fn desktop_settings_path() -> Option<PathBuf> {
@@ -1417,6 +1457,7 @@ struct MiniMlxApp {
     model_config_force_sampling: bool,
     model_config_chat_template_kwargs: String,
     model_config_mtp_draft: String,
+    model_config_saved_snapshot: Option<Vec<String>>,
     api_key_ready: bool,
     api_key_visible: bool,
 }
@@ -2103,6 +2144,7 @@ impl MiniMlxApp {
             model_config_force_sampling: false,
             model_config_chat_template_kwargs: String::new(),
             model_config_mtp_draft: String::new(),
+            model_config_saved_snapshot: None,
             settings,
             api_key_ready,
             api_key_visible: false,
@@ -4565,6 +4607,7 @@ impl MiniMlxApp {
             }
         }
         self.model_config_path = Some(model_path.to_string());
+        self.model_config_saved_snapshot = None;
         self.model_config_name = model_name.to_string();
         self.model_config_tab = ModelConfigTab::Basic;
         let draft_options = self.mtp_draft_options(model_path);
@@ -4676,10 +4719,24 @@ impl MiniMlxApp {
             .into_any_element()
     }
 
+    fn model_config_snapshot(&self) -> Vec<String> {
+        vec![
+            self.model_config_alias.clone(), self.model_config_max_tokens.clone(),
+            self.model_config_context_tokens.clone(), self.model_config_temperature.clone(),
+            self.model_config_top_p.clone(), self.model_config_top_k.clone(),
+            self.model_config_repetition_penalty.clone(), self.model_config_min_p.clone(),
+            self.model_config_presence_penalty.clone(), self.model_config_frequency_penalty.clone(),
+            self.model_config_expert_cache_gb.clone(), self.model_config_force_sampling.to_string(),
+            self.model_config_chat_template_kwargs.clone(), self.model_config_mtp_draft.clone(),
+        ]
+    }
+
     fn model_settings_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let saved = self.model_config_saved_snapshot.as_ref() == Some(&self.model_config_snapshot());
         let save = app_button("model-config-save")
-            .label(tr(&self.settings.language, "Save"))
+            .label(tr(&self.settings.language, if saved { "Saved" } else { "Save" }))
             .primary()
+            .disabled(saved)
             .on_click(cx.listener(|this, _, _window, cx| {
                 let Some(path) = this.model_config_path.clone() else {
                     return;
@@ -4890,6 +4947,7 @@ impl MiniMlxApp {
                     return;
                 }
                 this.settings = updated;
+                this.model_config_saved_snapshot = Some(this.model_config_snapshot());
                 let restart = this.api_running
                     && this
                         .loaded_model
@@ -7177,9 +7235,9 @@ impl MiniMlxApp {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .min_h(px(88.0))
-                                    .justify_center()
+                                    .w_full()
                                     .px_5()
+                                    .py_4()
                                     .bg(rgb(0xFEF2F2))
                                     .border_1()
                                     .border_color(rgb(0xFECACA))
@@ -7195,7 +7253,8 @@ impl MiniMlxApp {
                                         div()
                                             .text_size(px(12.0))
                                             .text_color(rgb(0x7F1D1D))
-                                            .child(error.clone()),
+                                            .w_full()
+                                            .child(benchmark_error_summary(error)),
                                     )
                                     .into_any_element()
                             } else {
@@ -7430,7 +7489,7 @@ impl MiniMlxApp {
                             Err(error) => {
                                 this.report.clear();
                                 this.benchmark_error = Some(error.clone());
-                                this.operation = format!("Benchmark failed: {error}");
+                                this.operation = "Benchmark failed".into();
                             }
                         }
                         cx.notify();
@@ -10157,6 +10216,14 @@ impl AssetSource for MiniMlxAssets {
 #[cfg(test)]
 mod asset_tests {
     use super::*;
+
+    #[test]
+    fn system_language_defaults_to_supported_ui_language() {
+        assert_eq!(language_for_system_preference("zh-Hans-CN"), "zh-CN");
+        assert_eq!(language_for_system_preference("zh_CN.UTF-8"), "zh-CN");
+        assert_eq!(language_for_system_preference("en-US"), "en");
+        assert_eq!(language_for_system_preference("fr-FR"), "en");
+    }
 
     #[test]
     fn chinese_ui_actions_and_runtime_statuses_are_localized() {

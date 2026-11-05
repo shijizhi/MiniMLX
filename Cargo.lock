@@ -3434,7 +3434,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "minimlx-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "minimlx-protocol",
  "minimlx-supervisor",
@@ -3442,7 +3442,7 @@ dependencies = [
 
 [[package]]
 name = "minimlx-gpui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cocoa 0.26.0",
  "gpui",
@@ -3459,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "minimlx-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3467,7 +3467,7 @@ dependencies = [
 
 [[package]]
 name = "minimlx-supervisor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "minimlx-protocol",
  "serde_json",

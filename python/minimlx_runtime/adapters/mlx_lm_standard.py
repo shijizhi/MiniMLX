@@ -25,6 +25,10 @@ class StandardTextAdapter:
         self._dflash_draft_model: Any | None = None
         self.offload_session: Qwen38OffloadSession | None = None
 
+    @property
+    def _dflash_enabled(self) -> bool:
+        return self._dflash_draft_model is not None
+
     @staticmethod
     def can_load(descriptor: ModelDescriptor) -> bool:
         model_type = descriptor.model_type.lower()

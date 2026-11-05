@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
@@ -284,6 +284,18 @@ class CapabilityResolver:
         missing_components: set[str] = set()
         for role in self.REQUIRED_ROLES:
             candidates = self.providers.candidates(role, descriptor, request)
+            # Explicit MTP selection may use a compatible MTP provider even
+            # when its normal version routing prefers another backend.
+            if Acceleration.MTP in environment.accelerations:
+                for registration in self.providers.registrations:
+                    if (role in registration.roles
+                            and Acceleration.MTP in registration.accelerations
+                            and registration.excluded_model_versions
+                            and registration not in candidates):
+                        mtp_candidate = replace(registration, excluded_model_versions=())
+                        if mtp_candidate.matches(descriptor, request):
+                            candidates.append(mtp_candidate)
+                candidates.sort(key=lambda item: (-item.priority, item.name))
             if not candidates:
                 missing_by_role.append(role.value)
                 for registration in self.providers.registrations:
@@ -843,7 +855,6 @@ def builtin_provider_registry() -> ProviderRegistry:
                 roles=frozenset({AdapterRole.COMPONENT}),
                 component_kind=ComponentKind.DRAFT_WEIGHTS,
                 families=("qwen3_5", "qwen3.5"),
-                excluded_model_versions=("qwen3.8",),
                 priority=100,
             ),
             AdapterRegistration(

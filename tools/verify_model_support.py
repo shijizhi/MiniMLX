@@ -45,6 +45,11 @@ def _print_execution_route(runtime, mtp_enabled: bool) -> None:
     print("execution_route=" + json.dumps(summary, sort_keys=True))
 
 
+def _eos_ids(tokenizer):
+    value = getattr(tokenizer, "eos_token_ids", ())
+    return {value} if isinstance(value, int) else set(value or ())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir", type=Path)
@@ -297,7 +302,7 @@ def main() -> None:
         lm._position_ids = None
         cache = lm.make_cache()
         current = mx.array([result.prompt_tokens], dtype=mx.uint32)
-        eos_ids = set(getattr(adapter.tokenizer, "eos_token_ids", ()) or ())
+        eos_ids = _eos_ids(adapter.tokenizer)
         target_ar_tokens = []
         import time
 
@@ -372,7 +377,7 @@ def main() -> None:
 
     print(f"peak_memory_gib={mx.get_peak_memory() / (1024**3):.3f}")
     if args.mtp_test_force_eos_at is not None:
-        eos_ids = set(getattr(adapter.tokenizer, "eos_token_ids", ()) or ())
+        eos_ids = _eos_ids(adapter.tokenizer)
         if (
             len(result.generated_tokens) <= args.mtp_test_force_eos_at
             or result.generated_tokens[-1] not in eos_ids
@@ -427,7 +432,7 @@ def _install_mtp_boundary_test_hook(adapter, mode, forced_target_tokens):
             if index != 1 or index in forced_target_tokens:
                 continue
             if mode == "eos":
-                eos_ids = sorted(set(getattr(adapter.tokenizer, "eos_token_ids", ()) or ()))
+                eos_ids = sorted(_eos_ids(adapter.tokenizer))
                 if not eos_ids:
                     raise RuntimeError("tokenizer exposes no EOS ids")
                 token = eos_ids[0]
@@ -437,7 +442,7 @@ def _install_mtp_boundary_test_hook(adapter, mode, forced_target_tokens):
                     raise RuntimeError("no corresponding draft token for forced rejection")
                 vocab_size = int(lm.args.vocab_size)
                 token = latest_draft_tokens[draft_index]
-                eos_ids = set(getattr(adapter.tokenizer, "eos_token_ids", ()) or ())
+                eos_ids = _eos_ids(adapter.tokenizer)
                 while token == latest_draft_tokens[draft_index] or token in eos_ids:
                     token = (token + 1) % vocab_size
             else:
@@ -464,7 +469,7 @@ def _run_mtp_boundary_tests(runtime, adapter, prompt, max_tokens) -> None:
     import mlx.core as mx
 
     lm = adapter.model.language_model
-    eos_ids = set(getattr(adapter.tokenizer, "eos_token_ids", ()) or ())
+    eos_ids = _eos_ids(adapter.tokenizer)
     if not eos_ids:
         raise RuntimeError("tokenizer exposes no EOS ids")
 
