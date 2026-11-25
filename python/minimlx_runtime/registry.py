@@ -1062,6 +1062,7 @@ def builtin_provider_registry() -> ProviderRegistry:
                     }
                 ),
                 required_dependencies=frozenset({"mlx-vlm"}),
+                excluded_model_versions=("inkling-2-mini",),
                 supports_streaming=True,
                 priority=70,
             ),

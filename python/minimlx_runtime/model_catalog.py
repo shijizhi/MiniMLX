@@ -30,6 +30,7 @@ STANDARD_MLX_LM_TEXT_FAMILIES = (
     "helium",
     "internlm2",
     "internlm3",
+    "inkling2_loop",
     "llama",
     "llama4_text",
     "mamba",

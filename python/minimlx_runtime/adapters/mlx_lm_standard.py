@@ -13,6 +13,18 @@ from ..offload import Qwen38OffloadSession, qwen38_should_use_ssd_offload
 from ..types import Acceleration, ExecutionPlan, ModelDescriptor
 
 
+def _visible_text(text: str, descriptor: ModelDescriptor | None) -> str:
+    if descriptor is None or descriptor.model_type.lower() != "inkling2_loop":
+        return text
+    marker = "<|content_text|>"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    text = text[start + len(marker):]
+    ends = [p for token in ("<|end_message|>", "<|content_model_end_sampling|>") if (p := text.find(token)) >= 0]
+    return text[:min(ends)] if ends else text
+
+
 class StandardTextAdapter:
     """Shared baseline for text families implemented by upstream mlx-lm."""
 
@@ -36,24 +48,34 @@ class StandardTextAdapter:
         if model_type not in STANDARD_MLX_LM_TEXT_FAMILIES:
             return False
         causal_lm = architecture.endswith("forcausallm")
+        inkling_conditional = (
+            model_type == "inkling2_loop"
+            and architecture.endswith("inkling2loopforconditionalgeneration")
+        )
         qwen35_text = (
             model_type in {"qwen3_5", "qwen3_5_moe"}
             and architecture.endswith("forconditionalgeneration")
         )
-        if not causal_lm and not qwen35_text:
+        if not causal_lm and not qwen35_text and not inkling_conditional:
             return False
 
         # mlx-lm applies a small set of documented model_type aliases before
         # importing a model module. Mirror those aliases for family matching;
         # the actual loader remains the authority for checkpoint compatibility.
-        aliases = {"mistral": "llama", "iquestcoder": "llama"}
+        aliases = {
+            "mistral": "llama",
+            "iquestcoder": "llama",
+            "inkling2_loop": "inkling2",
+        }
         module_name = aliases.get(model_type, model_type)
         try:
             distribution = importlib.metadata.distribution("mlx-lm")
-            return any(
-                str(path).replace("\\", "/")
-                == f"mlx_lm/models/{module_name}.py"
-                for path in distribution.files or ()
+            module_paths = {
+                str(path).replace("\\", "/") for path in distribution.files or ()
+            }
+            return (
+                f"mlx_lm/models/{module_name}.py" in module_paths
+                or f"mlx_lm/models/{module_name}/__init__.py" in module_paths
             )
         except importlib.metadata.PackageNotFoundError:
             return False
@@ -68,6 +90,20 @@ class StandardTextAdapter:
                 "mlx-lm is not installed in MiniMLX's .venv; "
                 "run tools/bootstrap_venv.sh"
             ) from exc
+        if descriptor.model_type.lower() == "inkling2_loop":
+            # mlx-lm loads weights itself, but its HF tokenizer asks
+            # AutoConfig to instantiate a generic config for this new type.
+            # Register the real top-level type so HF does not fall back to a
+            # blank PreTrainedConfig and emit a misleading mismatch warning.
+            from transformers import AutoConfig, PreTrainedConfig
+
+            class Inkling2LoopConfig(PreTrainedConfig):
+                model_type = "inkling2_loop"
+
+            try:
+                AutoConfig.register("inkling2_loop", Inkling2LoopConfig)
+            except ValueError:
+                pass
         tokenizer_config = (
             {"fix_mistral_regex": True}
             if descriptor.model_type.lower() == "mistral"
@@ -305,7 +341,7 @@ class StandardTextAdapter:
             if decode_tps > 0
             else max(0.0, (time.perf_counter() - started) * 1000.0 - prefill_ms)
         )
-        return prompt_tokens, generated_tokens, "".join(text), prefill_ms, decode_ms
+        return prompt_tokens, generated_tokens, _visible_text("".join(text), self.descriptor), prefill_ms, decode_ms
 
     def benchmark_generate_tokens(
         self, prompt_tokens: list[int], *, max_tokens: int, prefill_step_size: int

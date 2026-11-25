@@ -1,6 +1,7 @@
 # Install only in MiniMLX's own .venv.
 mlx
-mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde
+# Inkling 2 Mini support (upstream PR #2086; pinned for reproducible builds).
+mlx-lm @ git+https://github.com/ml-explore/mlx-lm.git@e2b5bbd3bd9d186dea895e60802aa765e70b9d93
 tokenizers
 safetensors
 dflash==0.1.0
